@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Site BuildName="(empty)"
+	BuildStamp="20250510-0719-Experimental"
+	Name="(empty)"
+	Generator="ctest-4.0.0"
+	CompilerName=""
+	CompilerVersion=""
+	OSName="Linux"
+	Hostname="ubuntu"
+	OSRelease="5.15.0-138-generic"
+	OSVersion="#148~20.04.1-Ubuntu SMP Fri Mar 28 14:32:35 UTC 2025"
+	OSPlatform="x86_64"
+	Is64Bits="1"
+	VendorString="GenuineIntel"
+	VendorID="Intel Corporation"
+	FamilyID="6"
+	ModelID="183"
+	ModelName="Intel(R) Core(TM) i9-14900K"
+	ProcessorCacheSize="36864"
+	NumberOfLogicalCPU="20"
+	NumberOfPhysicalCPU="20"
+	TotalVirtualMemory="2047"
+	TotalPhysicalMemory="15347"
+	LogicalProcessorsPerPhysical="1"
+	ProcessorClockFrequency="3187.25"
+	>
+	<Testing>
+		<StartDateTime>May 10 15:19 CST</StartDateTime>
+		<StartTestTime>1746861544</StartTestTime>
+		<TestList/>
+		<EndDateTime>May 10 15:19 CST</EndDateTime>
+		<EndTestTime>1746861544</EndTestTime>
+		<ElapsedMinutes>0</ElapsedMinutes>
+	</Testing>
+</Site>
