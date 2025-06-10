@@ -586,7 +586,6 @@ int CacheMigrationDpdk::Update(const std::string & /*table*/,
       }
       exponentialBackoff(attempt);
     }
-
     throw std::runtime_error("Max retries exceeded");
   } catch (const std::exception &e) {
     {
