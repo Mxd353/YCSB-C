@@ -21,34 +21,25 @@ void ConsistentHash::AddServer(const std::string &ip) {
   }
   rte_be32_t ip_be = addr.s_addr;
 
-  std::cout << "Adding " << virtual_node_count_
-            << " virtual nodes for server: " << ip << "\n";
-
   int added_nodes = 0;
   for (int i = 0; i < virtual_node_count_; ++i) {
     std::string virtualNode = ip + "#" + std::to_string(i);
     size_t hashValue = Hash(virtualNode);
-    if (hash_to_server_.find(hashValue) ==
-        hash_to_server_.end())  // 避免重复插入
-    {
+    if (hash_to_server_.find(hashValue) == hash_to_server_.end()) {
       auto it =
           std::lower_bound(hash_ring_.begin(), hash_ring_.end(), hashValue);
       hash_ring_.insert(it, hashValue);
       hash_to_server_[hashValue] = ip_be;
       ++added_nodes;
     } else {
-      std::cout << "Virtual node collision: " << virtualNode
+      std::cerr << "Virtual node collision: " << virtualNode
                 << " (hash: " << hashValue << ") already exists." << "\n";
     }
   }
-  std::cout << "Successfully added " << added_nodes << "/"
-            << virtual_node_count_ << " virtual nodes for server: " << ip
-            << "\n";
 }
 
 rte_be32_t ConsistentHash::FindServer(const std::string_view &key) {
-  if (hash_ring_.empty())  // 处理空环情况
-  {
+  if (hash_ring_.empty()) {
     std::cerr << "ERROR: Hash ring is empty when locating key: " << key
               << std::endl;
     throw std::runtime_error("Hash ring is empty, no servers available.");
@@ -72,21 +63,19 @@ ConsistentHash::ConsistentHash(const std::string &server_ip_file,
                              server_ip_file);
   }
 
-  std::cout << "\n===== Initializing Consistent Hash Ring =====\n";
   std::string ip;
   while (std::getline(file, ip)) {
     if (!ip.empty()) {
-      std::cout << "Loading physical server: " << ip << "\n";
       AddServer(ip);
     }
   }
   std::cout << "===== Ring initialization complete ====="
             << "\nTotal virtual nodes: " << hash_ring_.size()
-            << "\n=========================================\n";
+            << "\n========================================\n";
 }
 
 void ConsistentHash::MigrateKey(const std::string &key, rte_be32_t newServer) {
-  std::cout << "[MIGRATION] Key \"" << key
+  std::cerr << "[MIGRATION] Key \"" << key
             << "\" manually assigned to: " << newServer << "\n";
   key_override_.erase(key);
   key_override_[key] = newServer;
@@ -94,9 +83,9 @@ void ConsistentHash::MigrateKey(const std::string &key, rte_be32_t newServer) {
 
 void ConsistentHash::RemoveMigration(const std::string &key) {
   if (key_override_.erase(key)) {
-    std::cout << "[MIGRATION] Removed override for key: " << key << "\n";
+    std::cerr << "[MIGRATION] Removed override for key: " << key << "\n";
   } else {
-    std::cout << "[MIGRATION] No override found for key: " << key << "\n";
+    std::cerr << "[MIGRATION] No override found for key: " << key << "\n";
   }
 }
 
