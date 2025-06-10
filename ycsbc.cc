@@ -103,7 +103,8 @@ int main(const int argc, const char *argv[]) {
     printf("********** load result **********\n");
     printf(
         "Total ops  : %5d  use time: %6.3f s  IOPS: %6.2f iops (%6.2f us/op)\n",
-        sum, use_time / 1e6, sum * 1e6 / use_time, (double)use_time / sum);
+        sum, use_time / 1e6, sum * 1e6 / use_time,
+        (sum != 0 ? (double)use_time / sum : 0.0));
 
     printf("*********************************\n");
 
