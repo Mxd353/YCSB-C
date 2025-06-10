@@ -1,7 +1,0 @@
-{
-	"InstallScripts" : 
-	[
-		"/home/cc/Desktop/CacheMigration/YCSB-C/build/cmake_install.cmake"
-	],
-	"Parallel" : false
-}

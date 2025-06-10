@@ -1,7 +1,0 @@
-/home/cc/Desktop/CacheMigration/YCSB-C/build/CMakeFiles/ycsbc.dir
-/home/cc/Desktop/CacheMigration/YCSB-C/build/CMakeFiles/edit_cache.dir
-/home/cc/Desktop/CacheMigration/YCSB-C/build/CMakeFiles/rebuild_cache.dir
-/home/cc/Desktop/CacheMigration/YCSB-C/build/CMakeFiles/list_install_components.dir
-/home/cc/Desktop/CacheMigration/YCSB-C/build/CMakeFiles/install.dir
-/home/cc/Desktop/CacheMigration/YCSB-C/build/CMakeFiles/install/local.dir
-/home/cc/Desktop/CacheMigration/YCSB-C/build/CMakeFiles/install/strip.dir
