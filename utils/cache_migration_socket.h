@@ -17,7 +17,7 @@
 #include <vector>
 
 #include "consistent_hash.h"
-#include "utils/c_m_proto.h"
+#include "lib/c_m_proto.h"
 
 // namespace asio = boost::asio;
 

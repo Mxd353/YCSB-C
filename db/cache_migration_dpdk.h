@@ -10,7 +10,7 @@
 #include <vector>
 
 #include "core/db.h"
-#include "utils/c_m_proto.h"
+#include "lib/c_m_proto.h"
 #include "utils/consistent_hash.h"
 
 #define NUM_MBUFS 8191
