@@ -71,6 +71,7 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
     return;
   }
 
+  std::cout << "++++++++db initialization++++++++\n";
   std::string line;
   while (std::getline(veth_file, line)) {
     std::string veth, ip_str;
@@ -114,6 +115,7 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
       rte_exit(EXIT_FAILURE, "Cannot init port %" PRIu16 "\n", port);
     }
   }
+  std::cout << "+++++++++++++++++++++++++++++++++\n";
   running = true;
   LaunchThreads();
 }
@@ -152,6 +154,11 @@ void CacheMigrationDpdk::Init() {
   TxConf &core_conf = tx_cores_[rte_rand_max(num_tx_cores_)];
   assigned_ring_id = rte_rand_max(core_conf.rings.size());
   assigned_ring = core_conf.rings[assigned_ring_id];
+  if (assigned_ring == nullptr) {
+    std::cerr << "Failed to get assigned ring id: " << assigned_ring_id
+              << ", Error: " << rte_strerror(rte_errno) << "\n";
+    return;
+  }
 }
 
 void CacheMigrationDpdk::Close() {}
@@ -173,7 +180,6 @@ inline void CacheMigrationDpdk::AssignCores() {
 int CacheMigrationDpdk::PortInit(uint16_t port) {
   uint16_t nb_rxd = RX_RING_SIZE;
   uint16_t nb_txd = TX_RING_SIZE;
-  int retval;
 
   uint16_t nb_rx_cores = rx_cores_.size();
   uint16_t nb_tx_cores = tx_cores_.size();
@@ -187,6 +193,7 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
   if (!rte_eth_dev_is_valid_port(port)) return -1;
   memset(&port_conf, 0, sizeof(struct rte_eth_conf));
 
+  int retval;
   struct rte_eth_dev_info dev_info;
   retval = rte_eth_dev_info_get(port, &dev_info);
   if (retval != 0) {
@@ -231,20 +238,12 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
       }
       tx_cores_[q].rings.push_back(ring);
     }
+    std::cout << "Create " << tx_cores_[q].rings.size()
+              << " rings for lcore: " << tx_cores_[q].lcore_id << "\n";
   }
 
   retval = rte_eth_dev_start(port);
   if (retval < 0) return retval;
-
-  struct rte_ether_addr addr;
-  retval = rte_eth_macaddr_get(port, &addr);
-  if (retval < 0) {
-    printf("Failed to get MAC address on port %u: %s\n", port,
-           rte_strerror(-retval));
-    return retval;
-  }
-  printf("Port %u MAC: " RTE_ETHER_ADDR_PRT_FMT "\n", (unsigned)port,
-         RTE_ETHER_ADDR_BYTES(&addr));
 
   printf("Port %u MAC: " RTE_ETHER_ADDR_PRT_FMT "\n", (unsigned)port,
          RTE_ETHER_ADDR_BYTES(&s_eth_addr_));
@@ -261,47 +260,51 @@ void CacheMigrationDpdk::ProcessReceivedPacket(struct rte_mbuf *mbuf) {
   struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
   if (ip_hdr->next_proto_id != IP_PROTOCOLS_NETCACHE) return;
 
-  struct KVHeader *kv_header =
-      (struct KVHeader *)(ip_hdr + 1);
+  struct KVHeader *kv_header = (struct KVHeader *)(ip_hdr + 1);
   rte_prefetch0(kv_header);
   uint32_t request_id = rte_be_to_cpu_32(kv_header->request_id);
 
-  std::lock_guard<std::mutex> lock(request_map_mutex_);
+  std::shared_lock lock(request_map_mutex_);
   auto it = request_map_.find(request_id);
   if (it == request_map_.end()) return;
+
   auto &request = it->second;
 
-  uint8_t is_req =
-      static_cast<uint8_t>(GET_IS_REQ(kv_header->combined));
+  uint8_t is_req = static_cast<uint8_t>(GET_IS_REQ(kv_header->combined));
 
   if (likely(is_req == CACHE_REPLY || is_req == SERVER_REPLY)) {
-    if (request.op == READ_REQUEST) {
-      try {
-        std::vector<KVPair> data;
-        data.reserve(4);
+    if (!request.completed) {
+      request.completed = true;
+      if (request.op == READ_REQUEST && request.read_promise) {
+        try {
+          std::vector<KVPair> data;
+          data.reserve(4);
 
-        const char *base = kv_header->value1.data();
-        for (uint i = 0; i < 4; i++) {
-          data.emplace_back(field_names[i],
-                            std::string(base + i * VALUE_LENGTH, VALUE_LENGTH));
+          const char *base = kv_header->value1.data();
+          for (uint i = 0; i < 4; i++) {
+            data.emplace_back(
+                field_names[i],
+                std::string(base + i * VALUE_LENGTH, VALUE_LENGTH));
+          }
+
+          request.read_promise->set_value(data);
+        } catch (const std::future_error &e) {
+          std::cerr << "Read already satisfied: " << e.what() << std::endl;
         }
-
-        request.read_promise->set_value(data);
-      } catch (const std::future_error &e) {
-        std::cerr << "Read already satisfied: " << e.what() << std::endl;
-        request.read_promise->set_exception(std::current_exception());
+      } else if (request.op == WRITE_REQUEST && request.write_promise) {
+        try {
+          request.write_promise->set_value(true);
+        } catch (const std::future_error &e) {
+          std::cerr << "Write promise already satisfied: " << e.what()
+                    << std::endl;
+        }
       }
-    } else if (request.op == WRITE_REQUEST) {
-      try {
-        request.write_promise->set_value(true);
-      } catch (const std::future_error &e) {
-        std::cerr << "Write promise already satisfied: " << e.what()
-                  << std::endl;
-        request.write_promise->set_exception(std::current_exception());
+      if (ip_hdr->src_addr != request.daddr) {
+        consistent_hash_.MigrateKey(request.key, ip_hdr->src_addr);
       }
-    }
-    if (ip_hdr->src_addr != request.daddr) {
-      consistent_hash_.MigrateKey(request.key, ip_hdr->src_addr);
+    } else {
+      std::cerr << "Duplicate response for request_id = " << request_id
+                << std::endl;
     }
   } else {
     std::cerr << "Server rejected request_id = " << request_id << std::endl;
@@ -467,21 +470,16 @@ struct rte_mbuf *CacheMigrationDpdk::BuildRequestPacket(
   ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
 
   struct KVHeader *kv_header =
-      reinterpret_cast<KVHeader *>(pkt_data + RTE_ETHER_HDR_LEN +
-                                    IPV4_HDR_LEN);
+      reinterpret_cast<KVHeader *>(pkt_data + RTE_ETHER_HDR_LEN + IPV4_HDR_LEN);
   uint16_t combined = ENCODE_COMBINED(dev_id_, op);
   kv_header->request_id = rte_cpu_to_be_32(req_id);
   kv_header->combined = rte_cpu_to_be_16(combined);
   kv_header->count = 0;
   memcpy(kv_header->key.data(), key.data(), KEY_LENGTH);
-  memcpy(kv_header->value1.data(), values[0].second.data(),
-         VALUE_LENGTH);
-  memcpy(kv_header->value2.data(), values[1].second.data(),
-         VALUE_LENGTH);
-  memcpy(kv_header->value3.data(), values[2].second.data(),
-         VALUE_LENGTH);
-  memcpy(kv_header->value4.data(), values[3].second.data(),
-         VALUE_LENGTH);
+  memcpy(kv_header->value1.data(), values[0].second.data(), VALUE_LENGTH);
+  memcpy(kv_header->value2.data(), values[1].second.data(), VALUE_LENGTH);
+  memcpy(kv_header->value3.data(), values[2].second.data(), VALUE_LENGTH);
+  memcpy(kv_header->value4.data(), values[3].second.data(), VALUE_LENGTH);
   return mbuf;
 }
 
@@ -489,29 +487,31 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
                              const std::string &key,
                              const std::vector<std::string> * /*fields*/,
                              std::vector<KVPair> &result) {
+  uint32_t req_id = generate_request_id();
   try {
     read_count_.fetch_add(1);
-    uint32_t req_id = generate_request_id();
     rte_be32_t dst_ip = consistent_hash_.GetServerIp(key);
 
-    std::promise<std::vector<KVPair>> read_promise;
-    auto future = read_promise.get_future();
+    auto read_promise = std::make_shared<std::promise<std::vector<KVPair>>>();
+    auto future = read_promise->get_future();
 
     RequestInfo request;
-    request.read_promise = &read_promise;
+    request.read_promise = read_promise;
     request.daddr = dst_ip;
     request.key = key;
     request.op = READ_REQUEST;
 
     {
-      std::lock_guard<std::mutex> lock(request_map_mutex_);
-      request_map_[req_id] = std::move(request);
+      std::unique_lock lock(request_map_mutex_);
+      request_map_.emplace(req_id, std::move(request));
     }
 
-    auto mbuf =
-        BuildRequestPacket(key, READ_REQUEST, dst_ip, req_id, DEFAULT_VALUES);
-
     for (int attempt = 0; attempt < RETRIES; ++attempt) {
+      rte_mbuf *mbuf =
+          BuildRequestPacket(key, READ_REQUEST, dst_ip, req_id, DEFAULT_VALUES);
+      if (mbuf == nullptr) {
+        throw std::runtime_error("Failed to build request packet");
+      }
       if (rte_ring_enqueue(assigned_ring, mbuf) < 0) {
         rte_pktmbuf_free(mbuf);
         throw std::runtime_error("Failed to enqueue packet");
@@ -520,16 +520,20 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
           std::future_status::ready) {
         result = future.get();
         read_success_.fetch_add(1);
+        {
+          std::unique_lock lock(request_map_mutex_);
+          request_map_.erase(req_id);
+        }
         return DB::kOK;
       }
       exponentialBackoff(attempt);
     }
-    {
-      std::lock_guard<std::mutex> lock(request_map_mutex_);
-      request_map_.erase(req_id);
-    }
     throw std::runtime_error("Max retries exceeded");
   } catch (const std::exception &e) {
+    {
+      std::unique_lock lock(request_map_mutex_);
+      request_map_.erase(req_id);
+    }
     std::cerr << "Error in Read: " << e.what() << std::endl;
     no_result_.fetch_add(1);
     return DB::kErrorNoData;
@@ -539,31 +543,32 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
 int CacheMigrationDpdk::Update(const std::string & /*table*/,
                                const std::string &key,
                                std::vector<KVPair> &values) {
+  uint32_t req_id = generate_request_id();
   try {
     update_count_.fetch_add(1);
-    uint32_t req_id = generate_request_id();
+
     rte_be32_t dst_ip = consistent_hash_.GetServerIp(key);
 
-    std::promise<bool> write_promise;
-    auto future = write_promise.get_future();
+    auto write_promise = std::make_shared<std::promise<bool>>();
+    auto future = write_promise->get_future();
 
     RequestInfo request;
-    request.write_promise = &write_promise;
+    request.write_promise = write_promise;
     request.daddr = dst_ip;
     request.key = key;
     request.op = WRITE_REQUEST;
 
     {
-      std::lock_guard<std::mutex> lock(request_map_mutex_);
-      request_map_[req_id] = std::move(request);
-    }
-
-    auto mbuf = BuildRequestPacket(key, WRITE_REQUEST, dst_ip, req_id, values);
-    if (mbuf == nullptr) {
-      throw std::runtime_error("Failed to build request packet");
+      std::unique_lock lock(request_map_mutex_);
+      request_map_.emplace(req_id, std::move(request));
     }
 
     for (int attempt = 0; attempt < RETRIES; ++attempt) {
+      rte_mbuf *mbuf =
+          BuildRequestPacket(key, WRITE_REQUEST, dst_ip, req_id, values);
+      if (mbuf == nullptr) {
+        throw std::runtime_error("Failed to build request packet");
+      }
       if (rte_ring_enqueue(assigned_ring, mbuf) < 0) {
         rte_pktmbuf_free(mbuf);
         throw std::runtime_error("Failed to enqueue packet");
@@ -571,18 +576,23 @@ int CacheMigrationDpdk::Update(const std::string & /*table*/,
       if (future.wait_for(std::chrono::milliseconds(100)) ==
           std::future_status::ready) {
         if (future.get()) {
+          {
+            std::unique_lock lock(request_map_mutex_);
+            request_map_.erase(req_id);
+          }
           update_success_.fetch_add(1);
           return DB::kOK;
         }
       }
       exponentialBackoff(attempt);
     }
-    {
-      std::lock_guard<std::mutex> lock(request_map_mutex_);
-      request_map_.erase(req_id);
-    }
+
     throw std::runtime_error("Max retries exceeded");
   } catch (const std::exception &e) {
+    {
+      std::unique_lock lock(request_map_mutex_);
+      request_map_.erase(req_id);
+    }
     std::cerr << "Error in Update: " << e.what() << std::endl;
     update_failed_.fetch_add(1);
     return DB::kErrorNoData;

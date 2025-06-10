@@ -14,6 +14,9 @@
 
 #include "core/timer.h"
 
+const std::array<std::string, 4> fields = {"field0", "field1", "field2",
+                                           "field3"};
+
 CacheMigrationSocket::~CacheMigrationSocket() { Close(); }
 void CacheMigrationSocket::Close() {
   StopReceiveThread();
@@ -121,17 +124,9 @@ inline void StringFrom32Bit(std::vector<CacheMigrationSocket::KVPair> &result,
   result.reserve(4);
   const std::array<const uint8_t *, 4> values = {value1, value2, value3,
                                                  value4};
-  const char *field_prefix = "field";
-
   for (size_t i = 0; i < 4; ++i) {
-    char field_name[7];
-    std::memcpy(field_name, field_prefix, 5);
-    field_name[5] = '0' + static_cast<char>(i);
-    field_name[6] = '\0';
-
     result.emplace_back(CacheMigrationSocket::KVPair{
-        std::string(field_name),
-        std::string(reinterpret_cast<const char *>(values[i]), 4)});
+        fields[i], std::string(reinterpret_cast<const char *>(values[i]), 4)});
   }
 }
 

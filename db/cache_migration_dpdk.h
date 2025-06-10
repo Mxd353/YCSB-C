@@ -6,7 +6,7 @@
 #include <atomic>
 #include <future>
 #include <memory>
-#include <mutex>
+#include <shared_mutex>
 #include <vector>
 
 #include "core/db.h"
@@ -16,7 +16,7 @@
 #define NUM_MBUFS 8191
 #define MBUF_CACHE_SIZE 250
 #define RX_RING_SIZE 1024
-#define TX_RING_SIZE 16384
+#define TX_RING_SIZE 4096
 #define TX_RING_COUNT 32
 #define BURST_SIZE 32
 static constexpr int MAX_TX_CORES = 16;
@@ -27,7 +27,7 @@ extern std::atomic<bool> running;
 struct TxConf {
   uint lcore_id;
   uint16_t queue_id = 0;
-  std::vector<rte_ring*> rings{};
+  std::vector<rte_ring *> rings{};
 };
 
 namespace ycsbc {
@@ -88,16 +88,18 @@ class CacheMigrationDpdk : public DB {
   std::vector<std::unique_ptr<TxConf>> tx_args_;
 
   struct RequestInfo {
-    std::promise<std::vector<KVPair>> *read_promise = nullptr;
-    std::promise<bool> *write_promise = nullptr;
+    std::shared_ptr<std::promise<std::vector<KVPair>>> read_promise;
+    std::shared_ptr<std::promise<bool>> write_promise;
     std::string key;
     uint32_t daddr;
     uint8_t op;
 
+    bool completed = false;
+
     RequestInfo() : daddr(0), op(0) {}
   };
 
-  std::mutex request_map_mutex_;
+  std::shared_mutex request_map_mutex_;
   std::unordered_map<uint32_t, RequestInfo> request_map_;
 
   inline void AssignCores();

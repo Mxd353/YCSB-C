@@ -63,8 +63,8 @@ int main(const int argc, const char *argv[]) {
 
   const bool load = utils::StrToBool(props.GetProperty("load", "true"));
   const int num_threads = stoi(props.GetProperty("threadcount", "1"));
-  const bool print_stats = true;
-  const bool ding = utils::StrToBool(props.GetProperty("ding", "true"));
+  const bool print_stats = false;
+  // const bool ding = utils::StrToBool(props.GetProperty("ding", "false"));
   vector<future<int>> actual_ops;
   int total_ops = 0;
   int sum = 0;
@@ -82,7 +82,7 @@ int main(const int argc, const char *argv[]) {
     int ops_per_thread = total_ops / threads_to_launch;
     int remaining_ops = total_ops % threads_to_launch;
 
-    fprintf(stderr, "Do load use %d threads...\r", threads_to_launch);
+    fprintf(stderr, "Do load use %d threads...\n", threads_to_launch);
     timer.Start();
 
     for (int i = 0; i < threads_to_launch; ++i) {
@@ -127,7 +127,7 @@ int main(const int argc, const char *argv[]) {
   int threads_to_launch = std::min(num_threads, total_ops);
   int ops_per_thread = total_ops / threads_to_launch;
 
-  fprintf(stderr, "Do run use %d threads...\r", threads_to_launch);
+  fprintf(stderr, "Do run use %d threads...\n", threads_to_launch);
   timer.Start();
 
   for (int i = 0; i < threads_to_launch; ++i) {
@@ -187,8 +187,7 @@ int main(const int argc, const char *argv[]) {
     double op_iops = temp_cnt[op] * 1e6 / temp_time[op];
 
     printf(
-        "[%-6s] ops: %7lu  avg: %7.2f us  IOPS: %8.2f  (CPU time total: %4.1f "
-        "s)\n",
+        "[%-6s] ops: %7lu, avg: %7.2f us, IOPS: %8.2f  (CPU time total: %4.1f s)\n",
         opname, temp_cnt[op], avg_latency_us, op_iops, cpu_time_sec);
   }
 
@@ -202,12 +201,12 @@ int main(const int argc, const char *argv[]) {
     db->PrintStats();
     printf("-------------------------------------------\n");
   }
-  if (ding) {
-    int ret = system("mpg123 -q conf/ding.mp3");
-    if (ret != 0) {
-      std::cerr << "播放失败: " << ret << std::endl;
-    }
-  }
+  // if (ding) {
+  //   int ret = system("mpg123 -q conf/ding.mp3");
+  //   if (ret != 0) {
+  //     std::cerr << "播放失败: " << ret << std::endl;
+  //   }
+  // }
 
   delete db;
   return 0;
@@ -323,10 +322,10 @@ inline bool StrStartWith(const char *str, const char *pre) {
 }
 
 void Init(utils::Properties &props) {
-  props.SetProperty("dbname", "cache_migration");
+  props.SetProperty("dbname", "cache_migration_dpdk");
   props.SetProperty("threadcount", "1");
   props.SetProperty("load", "true");
-  props.SetProperty("ding", "true");
+  props.SetProperty("ding", "false");
 }
 
 void PrintInfo(utils::Properties &props) {
