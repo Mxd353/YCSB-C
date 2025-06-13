@@ -231,8 +231,8 @@ inline void CoreWorkload::NextTransactionScanKey(std::string &start_key,
   // end_key = BuildKeyName(key_num + scan_interval_);
   end_key = start_key;
   int index = log10(record_count_ / max_scan_len_);
-  index = (index - 2) > 0 ? index - 2 : 0;  // 不能满打满算，截止范围扩大一位
-  end_key[index]++;  // 截止范围在第四个字符++，这个取合适值就行
+  index = (index - 2) > 0 ? index - 2 : 0;
+  end_key[index]++;
 }
 
 static inline void fillchar8wirhint64(char *key, uint64_t value) {
@@ -245,12 +245,12 @@ static inline void fillchar8wirhint64(char *key, uint64_t value) {
   key[6] = ((char)(value >> 8)) & 0xff;
   key[7] = ((char)value) & 0xff;
 }
-
+ 
 inline std::string CoreWorkload::BuildKeyName(uint64_t key_num) {
   if (!ordered_inserts_) {
     key_num = utils::Hash(key_num);
   }
-  std::string key_buff(key_length_, '0');  // 初始化为 '0'
+  std::string key_buff(key_length_, '0');
   snprintf(&key_buff[0], key_length_ + 1, "%0*lx", key_length_, key_num);
   return key_buff;
 }

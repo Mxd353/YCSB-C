@@ -25,4 +25,4 @@ class ConsistentHash {
   void RemoveMigration(const std::string &key);
   rte_be32_t GetServerIp(const std::string &key);
 };
-#endif  // __CONSISTENT_HASH_H__
+#endif  // __CONSISTENT_HASH_H__s

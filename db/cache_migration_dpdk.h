@@ -6,21 +6,19 @@
 #include <atomic>
 #include <future>
 #include <memory>
-#include <shared_mutex>
 #include <vector>
 
 #include "core/db.h"
 #include "lib/c_m_proto.h"
+#include "lib/request_map.h"
 #include "utils/consistent_hash.h"
 
-#define NUM_MBUFS 8191
-#define MBUF_CACHE_SIZE 250
+#define NUM_MBUFS 16384
+#define MBUF_CACHE_SIZE 512
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 4096
 #define TX_RING_COUNT 32
 #define BURST_SIZE 32
-static constexpr int MAX_TX_CORES = 16;
-static constexpr int MAX_RX_CORES = 2;
 
 extern std::atomic<bool> running;
 
@@ -88,8 +86,10 @@ class CacheMigrationDpdk : public DB {
   std::vector<std::unique_ptr<TxConf>> tx_args_;
 
   struct RequestInfo {
-    std::shared_ptr<std::promise<std::vector<KVPair>>> read_promise;
-    std::shared_ptr<std::promise<bool>> write_promise;
+    std::shared_ptr<std::promise<std::vector<KVPair>>> read_promise =
+        std::make_shared<std::promise<std::vector<KVPair>>>();
+    std::shared_ptr<std::promise<bool>> write_promise =
+        std::make_shared<std::promise<bool>>();
     std::string key;
     uint32_t daddr;
     uint8_t op;
@@ -99,8 +99,21 @@ class CacheMigrationDpdk : public DB {
     RequestInfo() : daddr(0), op(0) {}
   };
 
-  std::shared_mutex request_map_mutex_;
-  std::unordered_map<uint32_t, RequestInfo> request_map_;
+  RequestMap<RequestInfo> request_map_;
+
+  struct RequestCleaner {
+    RequestCleaner(RequestMap<RequestInfo> &map, uint32_t id)
+        : map_(map), req_id_(id), active_(true) {}
+    void Cancel() { active_ = false; }
+    ~RequestCleaner() {
+      if (active_) map_.Erase(req_id_);
+    }
+
+   private:
+    RequestMap<RequestInfo> &map_;
+    uint32_t req_id_;
+    bool active_;
+  };
 
   inline void AssignCores();
   int PortInit(uint16_t port);

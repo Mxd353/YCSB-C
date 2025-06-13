@@ -24,6 +24,14 @@ if [[ ! -f "./build/ycsbc" ]]; then
     exit 1
 fi
 
-sudo env LD_LIBRARY_PATH="$LD_LIBRARY_PATH" ./build/ycsbc "$@" > ycsbc.output
+echo -e "\n============== $(date '+%F %T') ==============" >> ycsbc.output
+
+sudo env LD_LIBRARY_PATH="$LD_LIBRARY_PATH" ./build/ycsbc "$@" >> ycsbc.output
 # sudo env LD_LIBRARY_PATH="$LD_LIBRARY_PATH" perf record -F 99 -g -- ./build/ycsbc "$@"
 # sudo env LD_LIBRARY_PATH="$LD_LIBRARY_PATH" gdb --args ./build/ycsbc "$@"
+# sudo env LD_LIBRARY_PATH="$LD_LIBRARY_PATH" valgrind --leak-check=full --track-origins=yes ./build/ycsbc "$@"
+# for i in {1..10}
+# do
+#   echo -e "Use $i Threads" >> ycsbc.output
+#   sudo env LD_LIBRARY_PATH="$LD_LIBRARY_PATH" ./build/ycsbc -T $i -P workloads/workloadb.spec >> ycsbc.output
+# done

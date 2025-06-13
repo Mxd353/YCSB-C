@@ -43,16 +43,13 @@ inline double RandomDouble(double min = 0.0, double max = 1.0) {
 ///
 /// Returns an ASCII code that can be printed to desplay
 ///
-inline char RandomPrintChar() {
-  return rand() % 94 + 33;
-}
+inline char RandomPrintChar() { return rand() % 94 + 33; }
 
 class Exception : public std::exception {
  public:
-  Exception(const std::string &message) : message_(message) { }
-  const char* what() const noexcept {
-    return message_.c_str();
-  }
+  Exception(const std::string &message) : message_(message) {}
+  const char *what() const noexcept { return message_.c_str(); }
+
  private:
   std::string message_;
 };
@@ -69,11 +66,25 @@ inline bool StrToBool(std::string str) {
 }
 
 inline std::string Trim(const std::string &str) {
-  auto front = std::find_if_not(str.begin(), str.end(), [](int c){ return std::isspace(c); });
-  return std::string(front, std::find_if_not(str.rbegin(), std::string::const_reverse_iterator(front),
-      [](int c){ return std::isspace(c); }).base());
+  auto front = std::find_if_not(str.begin(), str.end(),
+                                [](int c) { return std::isspace(c); });
+  return std::string(
+      front,
+      std::find_if_not(str.rbegin(), std::string::const_reverse_iterator(front),
+                       [](int c) { return std::isspace(c); })
+          .base());
 }
 
-} // utils
+inline void ReverseRTE_IPV4(uint32_t ip, std::string &result) {
+  uint8_t a = (ip >> 24) & 0xFF;
+  uint8_t b = (ip >> 16) & 0xFF;
+  uint8_t c = (ip >> 8) & 0xFF;
+  uint8_t d = ip & 0xFF;
 
-#endif // YCSB_C_UTILS_H_
+  result = std::to_string(d) + "." + std::to_string(c) + "." +
+           std::to_string(b) + "." + std::to_string(a);
+}
+
+}  // namespace utils
+
+#endif  // YCSB_C_UTILS_H_

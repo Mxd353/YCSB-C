@@ -16,16 +16,12 @@ static const std::string field_names[4] = {"field0", "field1", "field2",
                                            "field3"};
 std::atomic<bool> running{false};
 
-thread_local int assigned_ring_id = -1;
-thread_local rte_ring *assigned_ring = nullptr;
+thread_local static int assigned_ring_id = -1;
+thread_local static rte_ring *assigned_ring = nullptr;
 
 static inline uint32_t generate_request_id() {
   static std::atomic<uint32_t> counter{0};
-  static std::random_device rd;
-  static std::mt19937 gen(rd());
-  std::uniform_int_distribution<uint32_t> dis(0, UINT32_MAX);
-
-  return dis(gen) ^ counter.fetch_add(1, std::memory_order_relaxed);
+  return counter.fetch_add(1, std::memory_order_relaxed);
 }
 
 static inline void exponentialBackoff(int attempt) {
@@ -107,14 +103,13 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
   rte_ether_unformat_addr("00:11:22:33:44:55", &s_eth_addr_);
   rte_ether_unformat_addr("aa:bb:cc:dd:ee:ff", &d_eth_addr_);
 
-  uint16_t port;
-  RTE_ETH_FOREACH_DEV(port) {
-    if (PortInit(port) != 0) {
-      std::cerr << "Failed to initialize port " << (unsigned)port
-                << ", Error: " << rte_strerror(rte_errno) << std::endl;
-      rte_exit(EXIT_FAILURE, "Cannot init port %" PRIu16 "\n", port);
-    }
+  uint16_t port = 0;
+  if (PortInit(port) != 0) {
+    std::cerr << "Failed to initialize port " << (unsigned)port
+              << ", Error: " << rte_strerror(rte_errno) << std::endl;
+    rte_exit(EXIT_FAILURE, "Cannot init port %" PRIu16 "\n", port);
   }
+
   std::cout << "+++++++++++++++++++++++++++++++++\n";
   running = true;
   LaunchThreads();
@@ -124,11 +119,9 @@ CacheMigrationDpdk::~CacheMigrationDpdk() {
   running = false;
   rte_eal_mp_wait_lcore();
 
-  uint16_t port;
-  RTE_ETH_FOREACH_DEV(port) {
-    rte_eth_dev_stop(port);
-    rte_eth_dev_close(port);
-  }
+  uint16_t port = 0;
+  rte_eth_dev_stop(port);
+  rte_eth_dev_close(port);
 
   for (auto &core : tx_cores_) {
     for (auto &ring : core.rings) {
@@ -144,21 +137,36 @@ CacheMigrationDpdk::~CacheMigrationDpdk() {
     rte_mempool_free(mbuf_pool_);
     mbuf_pool_ = nullptr;
   }
+
+  request_map_.Clear();
+
   std::cout << "CacheMigrationDpdk resources cleaned up." << std::endl;
 };
 
 void CacheMigrationDpdk::Init() {
+  static thread_local bool initialized = false;
+  if (initialized) return;
+
   auto selected = src_ips_[rte_rand_max(src_ips_size_)];
   src_ip_ = selected.first;
   dev_id_ = selected.second;
-  TxConf &core_conf = tx_cores_[rte_rand_max(num_tx_cores_)];
-  assigned_ring_id = rte_rand_max(core_conf.rings.size());
+
+  auto t_id = std::this_thread::get_id();
+  std::hash<std::thread::id> hasher;
+
+  int tx_core_index = hasher(t_id) % tx_cores_.size();
+  TxConf &core_conf = tx_cores_[tx_core_index];
+
+  assigned_ring_id = hasher(t_id) % core_conf.rings.size();
   assigned_ring = core_conf.rings[assigned_ring_id];
-  if (assigned_ring == nullptr) {
-    std::cerr << "Failed to get assigned ring id: " << assigned_ring_id
-              << ", Error: " << rte_strerror(rte_errno) << "\n";
+
+  if (!assigned_ring) {
+    std::cerr << "Failed to get ring[" << assigned_ring_id << "] from TX core "
+              << tx_core_index << ": " << rte_strerror(rte_errno) << "\n";
     return;
   }
+
+  initialized = true;
 }
 
 void CacheMigrationDpdk::Close() {}
@@ -201,6 +209,16 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
     return retval;
   }
 
+  if (dev_info.flow_type_rss_offloads & RTE_ETH_RSS_IP) {
+    port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
+    port_conf.rx_adv_conf.rss_conf.rss_key = nullptr;
+    port_conf.rx_adv_conf.rss_conf.rss_hf = RTE_ETH_RSS_IP;
+    printf("RSS enabled: RTE_ETH_RSS_IP\n");
+  } else {
+    port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
+    printf("WARNING: RSS_IP not supported, falling back to single queue.\n");
+  }
+
   if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
     port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 
@@ -225,15 +243,23 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
     if (retval < 0) return retval;
 
     tx_cores_[q].queue_id = q;
+    const int rings_per_core = (TX_RING_COUNT + nb_tx_cores - 1) / nb_tx_cores;
+    for (int i = 0; i < rings_per_core; ++i) {
+      std::string ring_name = "tx_ring_p" + std::to_string(getpid()) + "_c" +
+                              std::to_string(q) + "_i" + std::to_string(i);
+      struct rte_ring *old_ring = rte_ring_lookup(ring_name.c_str());
+      if (old_ring) rte_ring_free(old_ring);
 
-    for (int i = 0; i < TX_RING_COUNT / nb_tx_cores; ++i) {
-      std::string ring_name = "tx_ring_" + std::to_string(i);
-      auto *ring =
+      rte_ring *ring =
           rte_ring_create(ring_name.c_str(), TX_RING_SIZE, rte_socket_id(),
-                          RING_F_SP_ENQ | RING_F_SC_DEQ);
+                          RING_F_MP_HTS_ENQ | RING_F_SC_DEQ);
+      // auto *ring =
+      //     rte_ring_create(ring_name.c_str(), TX_RING_SIZE, rte_socket_id(),
+      //                     RING_F_SP_ENQ | RING_F_SC_DEQ);
       if (ring == nullptr) {
         std::cerr << "Failed to create tx ring: " << ring_name
                   << ", Error: " << rte_strerror(rte_errno) << "\n";
+        for (auto &r : tx_cores_[q].rings) rte_ring_free(r);
         return -1;
       }
       tx_cores_[q].rings.push_back(ring);
@@ -257,58 +283,67 @@ void CacheMigrationDpdk::ProcessReceivedPacket(struct rte_mbuf *mbuf) {
   struct rte_ether_hdr *eth_hdr =
       rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
   if (eth_hdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) return;
+
   struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
   if (ip_hdr->next_proto_id != IP_PROTOCOLS_NETCACHE) return;
 
   struct KVHeader *kv_header = (struct KVHeader *)(ip_hdr + 1);
   rte_prefetch0(kv_header);
-  uint32_t request_id = rte_be_to_cpu_32(kv_header->request_id);
 
-  std::shared_lock lock(request_map_mutex_);
-  auto it = request_map_.find(request_id);
-  if (it == request_map_.end()) return;
+  const uint32_t request_id = rte_be_to_cpu_32(kv_header->request_id);
 
-  auto &request = it->second;
+  const uint8_t is_req = GET_IS_REQ(kv_header->combined);
 
-  uint8_t is_req = static_cast<uint8_t>(GET_IS_REQ(kv_header->combined));
-
-  if (likely(is_req == CACHE_REPLY || is_req == SERVER_REPLY)) {
-    if (!request.completed) {
-      request.completed = true;
-      if (request.op == READ_REQUEST && request.read_promise) {
-        try {
-          std::vector<KVPair> data;
-          data.reserve(4);
-
-          const char *base = kv_header->value1.data();
-          for (uint i = 0; i < 4; i++) {
-            data.emplace_back(
-                field_names[i],
-                std::string(base + i * VALUE_LENGTH, VALUE_LENGTH));
-          }
-
-          request.read_promise->set_value(data);
-        } catch (const std::future_error &e) {
-          std::cerr << "Read already satisfied: " << e.what() << std::endl;
-        }
-      } else if (request.op == WRITE_REQUEST && request.write_promise) {
-        try {
-          request.write_promise->set_value(true);
-        } catch (const std::future_error &e) {
-          std::cerr << "Write promise already satisfied: " << e.what()
-                    << std::endl;
-        }
-      }
-      if (ip_hdr->src_addr != request.daddr) {
-        consistent_hash_.MigrateKey(request.key, ip_hdr->src_addr);
-      }
-    } else {
-      std::cerr << "Duplicate response for request_id = " << request_id
-                << std::endl;
-    }
-  } else {
+  if (is_req != CACHE_REPLY && is_req != SERVER_REPLY) {
     std::cerr << "Server rejected request_id = " << request_id << std::endl;
     return;
+  }
+
+  bool exist = request_map_.Modify(request_id, [&](auto &req) {
+    if (req->completed) {
+      std::cerr << "Duplicate response for request_id = " << request_id
+                << std::endl;
+      return;
+    }
+    req->completed = true;
+
+    try {
+      if (req->op == READ_REQUEST && req->read_promise) {
+        // thread_local std::vector<KVPair> tls_kv_buffer;
+        // tls_kv_buffer.clear();
+        // tls_kv_buffer.reserve(4);
+        // const char *base = kv_header->value1.data();
+        // for (uint i = 0; i < 4; i++) {
+        //   tls_kv_buffer.emplace_back(
+        //       field_names[i],
+        //       std::string(base + i * VALUE_LENGTH, VALUE_LENGTH));
+        // }
+
+        // req->read_promise->set_value(tls_kv_buffer);
+
+        std::vector<KVPair> data;
+        data.reserve(4);
+        const char *base = kv_header->value1.data();
+        for (uint i = 0; i < 4; i++) {
+          data.emplace_back(field_names[i],
+                            std::string(base + i * VALUE_LENGTH,
+                            VALUE_LENGTH));
+        }
+        req->read_promise->set_value(std::move(data));
+      } else if (req->op == WRITE_REQUEST && req->write_promise) {
+        req->write_promise->set_value(true);
+      }
+
+      if (ip_hdr->src_addr != req->daddr) {
+        consistent_hash_.MigrateKey(req->key, ip_hdr->src_addr);
+      }
+    } catch (const std::future_error &e) {
+      std::cerr << "[Packet] Future error: " << e.what() << std::endl;
+    }
+  });
+
+  if (!exist) {
+    std::cerr << "[Packet] Request not exist id: " << request_id << std::endl;
   }
 }
 
@@ -320,10 +355,9 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
     return;
   }
   if (rte_lcore_is_enabled(lcore_id) && lcore_id != rte_get_main_lcore()) {
-    uint16_t port;
+    uint16_t port = 0;
     uint16_t nb_rx;
 
-    RTE_ETH_FOREACH_DEV(port)
     if (rte_eth_dev_socket_id(port) >= 0 &&
         rte_eth_dev_socket_id(port) != (int)rte_socket_id())
       printf(
@@ -335,15 +369,18 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
     struct rte_mbuf *bufs[BURST_SIZE];
 
     while (running.load(std::memory_order_acquire)) {
-      RTE_ETH_FOREACH_DEV(port) {
-        nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
-        if (unlikely(nb_rx == 0)) continue;
-        if (nb_rx > 0) {
-          for (uint16_t i = 0; i < nb_rx; i++) {
-            if (bufs[i] != NULL) {
-              ProcessReceivedPacket(bufs[i]);
-              rte_pktmbuf_free(bufs[i]);
-            }
+      nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
+
+      if (unlikely(nb_rx == 0)) {
+        rte_delay_us(10);
+        continue;
+      }
+
+      if (nb_rx > 0) {
+        for (uint16_t i = 0; i < nb_rx; i++) {
+          if (bufs[i] != NULL) {
+            ProcessReceivedPacket(bufs[i]);
+            rte_pktmbuf_free(bufs[i]);
           }
         }
       }
@@ -368,7 +405,6 @@ inline int CacheMigrationDpdk::TxMain(void *arg) {
     }
   }
   uint16_t queue_id = ctx->queue_id;
-
   while (running.load(std::memory_order_acquire)) {
     bool got_pkts = false;
     for (auto *ring : rings) {
@@ -443,10 +479,11 @@ struct rte_mbuf *CacheMigrationDpdk::BuildRequestPacket(
     const std::vector<KVPair> &values) {
   struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool_);
   if (!mbuf) return nullptr;
+
   char *pkt_data = rte_pktmbuf_append(mbuf, TOTAL_LEN);
   if (!pkt_data) {
     rte_pktmbuf_free(mbuf);
-    printf("Failed to append packet data\n");
+    std::cerr << "Failed to append packet data\n";
     return nullptr;
   }
 
@@ -487,127 +524,131 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
                              const std::string &key,
                              const std::vector<std::string> * /*fields*/,
                              std::vector<KVPair> &result) {
-  uint32_t req_id = generate_request_id();
+  // std::unique_lock<std::shared_mutex> lock(mutex_);
+  const uint32_t req_id = generate_request_id();
+
+  read_count_.fetch_add(1, std::memory_order_relaxed);
+  const rte_be32_t dst_ip = consistent_hash_.GetServerIp(key);
+
+  auto read_promise = std::make_shared<std::promise<std::vector<KVPair>>>();
+  auto future = read_promise->get_future();
+
+  auto request = std::make_shared<RequestInfo>();
+  request->read_promise = read_promise;
+  request->daddr = dst_ip;
+  request->key = key;
+  request->op = READ_REQUEST;
+
+  if (!request_map_.Insert(req_id, std::move(request))) {
+    no_result_.fetch_add(1, std::memory_order_relaxed);
+    std::cerr << "[Read]Error to insert request: " << req_id << std::endl;
+    return DB::kErrorConflict;
+  }
+
+  RequestCleaner cleaner(request_map_, req_id);
+
   try {
-    read_count_.fetch_add(1);
-    rte_be32_t dst_ip = consistent_hash_.GetServerIp(key);
-
-    auto read_promise = std::make_shared<std::promise<std::vector<KVPair>>>();
-    auto future = read_promise->get_future();
-
-    RequestInfo request;
-    request.read_promise = read_promise;
-    request.daddr = dst_ip;
-    request.key = key;
-    request.op = READ_REQUEST;
-
-    {
-      std::unique_lock lock(request_map_mutex_);
-      request_map_.emplace(req_id, std::move(request));
-    }
-
     for (int attempt = 0; attempt < RETRIES; ++attempt) {
       rte_mbuf *mbuf =
           BuildRequestPacket(key, READ_REQUEST, dst_ip, req_id, DEFAULT_VALUES);
-      if (mbuf == nullptr) {
+      if (!mbuf) {
         throw std::runtime_error("Failed to build request packet");
       }
+
+      std::unique_ptr<rte_mbuf, decltype(&rte_pktmbuf_free)> mbuf_guard(
+          mbuf, rte_pktmbuf_free);
       if (rte_ring_enqueue(assigned_ring, mbuf) < 0) {
-        rte_pktmbuf_free(mbuf);
         throw std::runtime_error("Failed to enqueue packet");
       }
-      if (future.wait_for(std::chrono::milliseconds(100)) ==
+      mbuf_guard.release();
+
+      if (future.wait_for(std::chrono::milliseconds(50)) ==
           std::future_status::ready) {
         result = future.get();
-        read_success_.fetch_add(1);
-        {
-          std::unique_lock lock(request_map_mutex_);
-          request_map_.erase(req_id);
-        }
+        read_success_.fetch_add(1, std::memory_order_relaxed);
         return DB::kOK;
       }
       exponentialBackoff(attempt);
     }
     throw std::runtime_error("Max retries exceeded");
   } catch (const std::exception &e) {
-    {
-      std::unique_lock lock(request_map_mutex_);
-      request_map_.erase(req_id);
-    }
-    std::cerr << "Error in Read: " << e.what() << std::endl;
-    no_result_.fetch_add(1);
+    std::cerr << "Error in Read: " << e.what() << ", req_id: " << req_id
+              << std::endl;
+    no_result_.fetch_add(1, std::memory_order_relaxed);
     return DB::kErrorNoData;
   }
 }
 
-int CacheMigrationDpdk::Update(const std::string & /*table*/,
+int CacheMigrationDpdk::Insert(const std::string & /*table*/,
                                const std::string &key,
                                std::vector<KVPair> &values) {
-  uint32_t req_id = generate_request_id();
+  // std::unique_lock<std::shared_mutex> lock(mutex_);
+  const uint32_t req_id = generate_request_id();
+  update_count_.fetch_add(1, std::memory_order_relaxed);
+  const rte_be32_t dst_ip = consistent_hash_.GetServerIp(key);
+
+  auto write_promise = std::make_shared<std::promise<bool>>();
+  auto future = write_promise->get_future();
+
+  auto request = std::make_shared<RequestInfo>();
+  request->write_promise = write_promise;
+  request->daddr = dst_ip;
+  request->key = key;
+  request->op = WRITE_REQUEST;
+
+  if (!request_map_.Insert(req_id, std::move(request))) {
+    update_failed_.fetch_add(1, std::memory_order_relaxed);
+    std::cerr << "[Insert]Error to insert request: " << req_id << std::endl;
+    return DB::kErrorConflict;
+  }
+
+  RequestCleaner cleaner(request_map_, req_id);
+
   try {
-    update_count_.fetch_add(1);
-
-    rte_be32_t dst_ip = consistent_hash_.GetServerIp(key);
-
-    auto write_promise = std::make_shared<std::promise<bool>>();
-    auto future = write_promise->get_future();
-
-    RequestInfo request;
-    request.write_promise = write_promise;
-    request.daddr = dst_ip;
-    request.key = key;
-    request.op = WRITE_REQUEST;
-
-    {
-      std::unique_lock lock(request_map_mutex_);
-      request_map_.emplace(req_id, std::move(request));
-    }
-
     for (int attempt = 0; attempt < RETRIES; ++attempt) {
       rte_mbuf *mbuf =
           BuildRequestPacket(key, WRITE_REQUEST, dst_ip, req_id, values);
-      if (mbuf == nullptr) {
+      if (!mbuf) {
         throw std::runtime_error("Failed to build request packet");
       }
+
+      std::unique_ptr<rte_mbuf, decltype(&rte_pktmbuf_free)> mbuf_guard(
+          mbuf, rte_pktmbuf_free);
       if (rte_ring_enqueue(assigned_ring, mbuf) < 0) {
-        rte_pktmbuf_free(mbuf);
         throw std::runtime_error("Failed to enqueue packet");
       }
-      if (future.wait_for(std::chrono::milliseconds(100)) ==
+      mbuf_guard.release();
+
+      if (future.wait_for(std::chrono::milliseconds(50)) ==
           std::future_status::ready) {
         if (future.get()) {
-          {
-            std::unique_lock lock(request_map_mutex_);
-            request_map_.erase(req_id);
-          }
-          update_success_.fetch_add(1);
+          update_success_.fetch_add(1, std::memory_order_relaxed);
           return DB::kOK;
+        } else {
+          return DB::kErrorRejected;
         }
       }
       exponentialBackoff(attempt);
     }
     throw std::runtime_error("Max retries exceeded");
   } catch (const std::exception &e) {
-    {
-      std::unique_lock lock(request_map_mutex_);
-      request_map_.erase(req_id);
-    }
-    std::cerr << "Error in Update: " << e.what() << std::endl;
-    update_failed_.fetch_add(1);
+    std::cerr << "Error in Insert: " << e.what() << ", req_id: " << req_id
+              << std::endl;
+    update_failed_.fetch_add(1, std::memory_order_relaxed);
     return DB::kErrorNoData;
   }
 }
 
-int CacheMigrationDpdk::Scan(const std::string & /*table*/,
-                             const std::string & /*key*/, int /*record_count*/,
-                             const std::vector<std::string> * /*fields*/,
-                             std::vector<std::vector<KVPair>> & /*result*/) {
-  return DB::kOK;  // Not implemented for now
+int CacheMigrationDpdk::Update(const std::string &table, const std::string &key,
+                               std::vector<KVPair> &values) {
+  return Insert(table, key, values);
 }
 
-int CacheMigrationDpdk::Insert(const std::string &table, const std::string &key,
-                               std::vector<KVPair> &values) {
-  return Update(table, key, values);
+int CacheMigrationDpdk::Scan(const std::string & /*table*/,
+                             const std::string & /*key*/, int /*record_count*/,
+                             const std::vector<std::string> * /*key*/,
+                             std::vector<std::vector<KVPair>> & /*result*/) {
+  return DB::kOK;  // Not implemented for now
 }
 
 int CacheMigrationDpdk::Delete(const std::string &table,
