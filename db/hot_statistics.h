@@ -10,7 +10,7 @@
 
 #include "core/db.h"
 #include "core/utils.h"
-#include "utils/consistent_hash.h"
+#include "lib/consistent_hash.h"
 
 namespace ycsbc {
 

@@ -32,7 +32,7 @@ include_directories(
     ${CMAKE_SOURCE_DIR}/
     ${CMAKE_SOURCE_DIR}/core
     ${CMAKE_SOURCE_DIR}/db
-    ${CMAKE_SOURCE_DIR}/utils
+    ${CMAKE_SOURCE_DIR}/lib
 )
 
 cmake_policy(SET CMP0167 NEW)
@@ -72,7 +72,7 @@ message(STATUS "DPDK_LIBRARIES: ${DPDK_LIBRARIES}")
 file(GLOB_RECURSE SOURCE_FILES
     "${CMAKE_SOURCE_DIR}/core/*.cc"
     "${CMAKE_SOURCE_DIR}/db/*.cc"
-    "${CMAKE_SOURCE_DIR}/utils/*.cc"
+    "${CMAKE_SOURCE_DIR}/lib/*.cc"
     "${CMAKE_SOURCE_DIR}/ycsbc.cc"
 )
 

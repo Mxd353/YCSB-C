@@ -11,7 +11,7 @@
 #include "core/db.h"
 #include "lib/c_m_proto.h"
 #include "lib/request_map.h"
-#include "utils/consistent_hash.h"
+#include "lib/consistent_hash.h"
 
 #define NUM_MBUFS 16384
 #define MBUF_CACHE_SIZE 512
