@@ -20,3 +20,4 @@ bfrt/echo_server.py
 pcap_output/
 *.pyc
 *.output
+*.txt
