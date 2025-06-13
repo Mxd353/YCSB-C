@@ -7,11 +7,9 @@ project(ycsbc
 set(HOME_DIR $ENV{HOME})
 message(STATUS "HOME_DIR = ${HOME_DIR}")
 
-set(CMAKE_C_COMPILER "${HOME_DIR}/gcc/bin/gcc")
-if(EXISTS "${HOME_DIR}/gcc/bin/g++")
+if(EXISTS "${HOME_DIR}/gcc/bin/gcc" AND EXISTS "${HOME_DIR}/gcc/bin/g++")
+    set(CMAKE_C_COMPILER "${HOME_DIR}/gcc/bin/gcc")
     set(CMAKE_CXX_COMPILER "${HOME_DIR}/gcc/bin/g++")
-else()
-    message(FATAL_ERROR "Custom g++ not found at ${HOME_DIR}/gcc/bin/g++")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -37,20 +35,30 @@ include_directories(
 
 cmake_policy(SET CMP0167 NEW)
 
-set(BOOST_ROOT "${HOME_DIR}/lib/boost")
-set(Boost_NO_SYSTEM_PATHS ON)
+if(EXISTS "${HOME_DIR}/lib/boost")
+    set(BOOST_ROOT "${HOME_DIR}/lib/boost")
+    set(Boost_NO_SYSTEM_PATHS ON)
+endif()
 find_package(Boost REQUIRED COMPONENTS system)
 if(Boost_FOUND)
     message(STATUS "Boost found: ${Boost_VERSION}")
     message(STATUS "Boost include dir: ${Boost_INCLUDE_DIRS}")
     message(STATUS "Boost libraries: ${Boost_LIBRARIES}")
+else()
+    message(FATAL_ERROR "Boost not found!")
 endif()
 
+if(EXISTS "${HOME_DIR}/lib/tbb")
+    set(BOOST_ROOT "${HOME_DIR}/lib/tbb")
+    set(Boost_NO_SYSTEM_PATHS ON)
+endif()
 find_package(TBB REQUIRED)
 if(TBB_FOUND)
     message(STATUS "TBB found: ${TBB_VERSION}")
     message(STATUS "TBB include dir: ${TBB_INCLUDE_DIRS}")
     message(STATUS "TBB libraries: ${TBB_LIBRARIES}")
+else()
+    message(FATAL_ERROR "TBB not found!")
 endif()
 
 find_package(Threads REQUIRED)
@@ -60,14 +68,23 @@ endif()
 
 find_package(PkgConfig REQUIRED)
 
-set(DPDK_PATH ${HOME_DIR}/lib/dpdk)
-set(DPDK_LIB_DIR "${DPDK_PATH}/lib/x86_64-linux-gnu")
-set(ENV{PKG_CONFIG_PATH} "${DPDK_LIB_DIR}/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+if(EXISTS "${HOME_DIR}/lib/dpdk")
+    set(DPDK_PATH "${HOME_DIR}/lib/dpdk")
+    set(DPDK_LIB_DIR "${DPDK_PATH}/lib/x86_64-linux-gnu")
+    set(ENV{PKG_CONFIG_PATH} "${DPDK_LIB_DIR}/pkgconfig:$ENV{PKG_CONFIG_PATH}")
+endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(DPDK REQUIRED libdpdk)
-message(STATUS "DPDK_INCLUDE_DIRS: ${DPDK_PATH}/include")
-message(STATUS "DPDK_LIBRARY_DIRS: ${DPDK_LIBRARY_DIRS}")
-message(STATUS "DPDK_LIBRARIES: ${DPDK_LIBRARIES}")
+include_directories(${DPDK_INCLUDE_DIRS})
+link_directories(${DPDK_LIBRARY_DIRS})
+if(DPDK_FOUND)
+    message(STATUS "DPDK_INCLUDE_DIRS: ${DPDK_PATH}/include")
+    message(STATUS "DPDK_LIBRARY_DIRS: ${DPDK_LIBRARY_DIRS}")
+    message(STATUS "DPDK_LIBRARIES: ${DPDK_LIBRARIES}")
+else()
+    message(FATAL_ERROR "DPDK not found. Make sure pkg-config can find libdpdk.pc.")
+endif()
+
 
 file(GLOB_RECURSE SOURCE_FILES
     "${CMAKE_SOURCE_DIR}/core/*.cc"
@@ -105,14 +122,12 @@ target_compile_options(${TARGET_NAME}
 )
 
 file(GLOB_RECURSE WORKLOADS "${CMAKE_SOURCE_DIR}/workloads/*")
-
 foreach(workload_file ${WORKLOADS})
     get_filename_component(workload_name ${workload_file} NAME)
     configure_file(${workload_file} ${CMAKE_CURRENT_BINARY_DIR}/workloads/${workload_name} COPYONLY)
 endforeach()
 
 file(GLOB_RECURSE CONF_FILES "${CMAKE_SOURCE_DIR}/conf/*")
-
 foreach(conf_file ${CONF_FILES})
     get_filename_component(conf_name ${conf_file} NAME)
     configure_file(${conf_file} ${CMAKE_CURRENT_BINARY_DIR}/conf/${conf_name} COPYONLY)
