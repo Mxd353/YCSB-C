@@ -63,7 +63,7 @@ int main(const int argc, const char *argv[]) {
 
   const bool load = utils::StrToBool(props.GetProperty("load", "true"));
   const int num_threads = stoi(props.GetProperty("threadcount", "1"));
-  const bool print_stats = false;
+  const bool print_stats = true;
   // const bool ding = utils::StrToBool(props.GetProperty("ding", "false"));
   vector<future<int>> actual_ops;
   int total_ops = 0;
@@ -95,7 +95,11 @@ int main(const int argc, const char *argv[]) {
     sum = 0;
     for (auto &n : actual_ops) {
       assert(n.valid());
-      sum += n.get();
+      try {
+        sum += n.get();
+      } catch (const std::exception &e) {
+        std::cerr << "Error in thread: " << e.what() << std::endl;
+      }
     }
     auto use_time = timer.End();
     fflush(stderr);
@@ -103,8 +107,7 @@ int main(const int argc, const char *argv[]) {
     printf("********** load result **********\n");
     printf(
         "Total ops  : %5d  use time: %6.3f s  IOPS: %6.2f iops (%6.2f us/op)\n",
-        sum, use_time / 1e6, sum * 1e6 / use_time,
-        (sum != 0 ? (double)use_time / sum : 0.0));
+        sum, use_time / 1e6, sum * 1e6 / use_time, (double)use_time / sum);
 
     printf("*********************************\n");
 
@@ -113,6 +116,9 @@ int main(const int argc, const char *argv[]) {
       db->PrintStats();
       printf("-------------------------------------------\n");
     }
+
+    fprintf(stderr, "Wait for db saving...\n");
+    sleep(2);
   }
 
   // Peforms transactions
@@ -138,7 +144,11 @@ int main(const int argc, const char *argv[]) {
   sum = 0;
   for (auto &n : actual_ops) {
     assert(n.valid());
-    sum += n.get();
+    try {
+      sum += n.get();
+    } catch (const std::exception &e) {
+      std::cerr << "Error in thread: " << e.what() << std::endl;
+    }
   }
   auto use_time = timer.End();
   fflush(stderr);
@@ -187,7 +197,8 @@ int main(const int argc, const char *argv[]) {
     double op_iops = temp_cnt[op] * 1e6 / temp_time[op];
 
     printf(
-        "[%-6s] ops: %7lu, avg: %7.2f us, IOPS: %8.2f  (CPU time total: %4.1f s)\n",
+        "[%-6s] ops: %7lu, avg: %7.2f us, IOPS: %8.2f  (CPU time total: %4.1f "
+        "s)\n",
         opname, temp_cnt[op], avg_latency_us, op_iops, cpu_time_sec);
   }
 

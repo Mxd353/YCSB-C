@@ -20,6 +20,8 @@ class DB {
   static const int kOK = 0;
   static const int kErrorNoData = 1;
   static const int kErrorConflict = 2;
+  static const int kErrorTimeout = 3;
+  static const int kErrorRejected = 4;
   ///
   /// Initializes any state for accessing this DB.
   /// Called once per DB client (thread); there is a single DB instance
