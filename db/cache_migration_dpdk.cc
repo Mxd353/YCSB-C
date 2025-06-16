@@ -309,25 +309,12 @@ void CacheMigrationDpdk::ProcessReceivedPacket(struct rte_mbuf *mbuf) {
 
     try {
       if (req->op == READ_REQUEST && req->read_promise) {
-        // thread_local std::vector<KVPair> tls_kv_buffer;
-        // tls_kv_buffer.clear();
-        // tls_kv_buffer.reserve(4);
-        // const char *base = kv_header->value1.data();
-        // for (uint i = 0; i < 4; i++) {
-        //   tls_kv_buffer.emplace_back(
-        //       field_names[i],
-        //       std::string(base + i * VALUE_LENGTH, VALUE_LENGTH));
-        // }
-
-        // req->read_promise->set_value(tls_kv_buffer);
-
         std::vector<KVPair> data;
         data.reserve(4);
         const char *base = kv_header->value1.data();
         for (uint i = 0; i < 4; i++) {
           data.emplace_back(field_names[i],
-                            std::string(base + i * VALUE_LENGTH,
-                            VALUE_LENGTH));
+                            std::string(base + i * VALUE_LENGTH, VALUE_LENGTH));
         }
         req->read_promise->set_value(std::move(data));
       } else if (req->op == WRITE_REQUEST && req->write_promise) {
@@ -511,7 +498,6 @@ struct rte_mbuf *CacheMigrationDpdk::BuildRequestPacket(
   uint16_t combined = ENCODE_COMBINED(dev_id_, op);
   kv_header->request_id = rte_cpu_to_be_32(req_id);
   kv_header->combined = rte_cpu_to_be_16(combined);
-  kv_header->count = 0;
   memcpy(kv_header->key.data(), key.data(), KEY_LENGTH);
   memcpy(kv_header->value1.data(), values[0].second.data(), VALUE_LENGTH);
   memcpy(kv_header->value2.data(), values[1].second.data(), VALUE_LENGTH);

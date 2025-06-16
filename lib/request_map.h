@@ -11,7 +11,7 @@ class RequestMap {
  public:
   using MapType = tbb::concurrent_unordered_map<U, std::shared_ptr<T>>;
 
-  bool Insert(U req_id, std::shared_ptr<T> req) {
+  bool Insert(U req_id, std::shared_ptr<T>&& req) {
     auto [it, inserted] = map_.insert({req_id, std::move(req)});
     return inserted;
   }
@@ -44,3 +44,23 @@ class RequestMap {
   std::shared_mutex map_mutex_;
   MapType map_;
 };
+
+template <typename K, typename V>
+struct RequestCleaner {
+  RequestCleaner(RequestMap<K, V>& map, const K& id)
+      : map_(map), req_id_(id), active_(true) {}
+
+  void Cancel() { active_ = false; }
+
+  ~RequestCleaner() {
+    if (active_) map_.Erase(req_id_);
+  }
+
+ private:
+  RequestMap<K, V>& map_;
+  K req_id_;
+  bool active_;
+};
+
+template <typename K, typename V>
+RequestCleaner(RequestMap<K, V>&, K) -> RequestCleaner<K, V>;

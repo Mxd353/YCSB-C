@@ -57,7 +57,7 @@ struct BaseHeader {
 struct KVHeader : public BaseHeader {
   uint16_t
       combined;  // dev_id(8 bit) | is_req(4 bit) | op(2 bit) | hot_query(2 bit)
-  uint32_t count;
+  uint32_t count = 0;
   std::array<char, KEY_LENGTH> key{};
   std::array<char, VALUE_LENGTH> value1{};
   std::array<char, VALUE_LENGTH> value2{};

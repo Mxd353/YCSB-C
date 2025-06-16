@@ -101,20 +101,6 @@ class CacheMigrationDpdk : public DB {
 
   RequestMap<uint32_t, RequestInfo> request_map_;
 
-  struct RequestCleaner {
-    RequestCleaner(RequestMap<uint32_t, RequestInfo> &map, uint32_t id)
-        : map_(map), req_id_(id), active_(true) {}
-    void Cancel() { active_ = false; }
-    ~RequestCleaner() {
-      if (active_) map_.Erase(req_id_);
-    }
-
-   private:
-    RequestMap<uint32_t, RequestInfo> &map_;
-    uint32_t req_id_;
-    bool active_;
-  };
-
   inline void AssignCores();
   int PortInit(uint16_t port);
   inline void LaunchThreads();
