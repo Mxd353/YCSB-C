@@ -99,10 +99,10 @@ class CacheMigrationDpdk : public DB {
     RequestInfo() : daddr(0), op(0) {}
   };
 
-  RequestMap<RequestInfo> request_map_;
+  RequestMap<uint32_t, RequestInfo> request_map_;
 
   struct RequestCleaner {
-    RequestCleaner(RequestMap<RequestInfo> &map, uint32_t id)
+    RequestCleaner(RequestMap<uint32_t, RequestInfo> &map, uint32_t id)
         : map_(map), req_id_(id), active_(true) {}
     void Cancel() { active_ = false; }
     ~RequestCleaner() {
@@ -110,7 +110,7 @@ class CacheMigrationDpdk : public DB {
     }
 
    private:
-    RequestMap<RequestInfo> &map_;
+    RequestMap<uint32_t, RequestInfo> &map_;
     uint32_t req_id_;
     bool active_;
   };

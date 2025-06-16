@@ -6,23 +6,23 @@
 #include <shared_mutex>
 #include <utility>
 
-template <typename T>
+template <typename U, typename T>
 class RequestMap {
  public:
-  using MapType = tbb::concurrent_unordered_map<uint32_t, std::shared_ptr<T>>;
+  using MapType = tbb::concurrent_unordered_map<U, std::shared_ptr<T>>;
 
-  bool Insert(uint32_t req_id, std::shared_ptr<T> req) {
+  bool Insert(U req_id, std::shared_ptr<T> req) {
     auto [it, inserted] = map_.insert({req_id, std::move(req)});
     return inserted;
   }
 
-  std::shared_ptr<T> Get(uint32_t req_id) const {
+  std::shared_ptr<T> Get(U req_id) const {
     auto it = map_.find(req_id);
     return (it != map_.end()) ? it->second : nullptr;
   }
 
   template <typename Fn>
-  bool Modify(uint32_t req_id, Fn&& fn) {
+  bool Modify(U req_id, Fn&& fn) {
     auto it = map_.find(req_id);
     if (it != map_.end()) {
       fn(it->second);
@@ -31,7 +31,7 @@ class RequestMap {
     return false;
   }
 
-  bool Erase(uint32_t req_id) noexcept {
+  bool Erase(U req_id) noexcept {
     std::unique_lock<std::shared_mutex> lock(map_mutex_);
     return map_.unsafe_erase(req_id) > 0;
   }
