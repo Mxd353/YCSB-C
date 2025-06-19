@@ -322,7 +322,7 @@ void CacheMigrationDpdk::ProcessReceivedPacket(struct rte_mbuf *mbuf) {
       }
 
       if (ip_hdr->src_addr != req->daddr) {
-        consistent_hash_.MigrateKey(req->key, ip_hdr->src_addr);
+        consistent_hash_.MigrateKey(req->key, req->daddr, ip_hdr->src_addr);
       }
     } catch (const std::future_error &e) {
       std::cerr << "[Packet] Future error: " << e.what() << std::endl;

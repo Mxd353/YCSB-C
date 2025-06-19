@@ -5,6 +5,8 @@
 #include <fstream>
 #include <iostream>
 
+#include "core/utils.h"
+
 size_t ConsistentHash::Hash(const std::string_view &key) {
   boost::crc_32_type crc;
   crc.process_bytes(key.data(), key.size());
@@ -74,9 +76,14 @@ ConsistentHash::ConsistentHash(const std::string &server_ip_file,
             << "\n========================================\n";
 }
 
-void ConsistentHash::MigrateKey(const std::string &key, rte_be32_t newServer) {
-  std::cerr << "[MIGRATION] Key \"" << key
-            << "\" manually assigned to: " << newServer << "\n";
+void ConsistentHash::MigrateKey(const std::string &key, rte_be32_t oldServer, rte_be32_t newServer) {
+  std::string oldip_str;
+  utils::ReverseRTE_IPV4(uint32_t(oldServer), oldip_str);
+  std::string newip_str;
+  utils::ReverseRTE_IPV4(uint32_t(newServer), newip_str);
+  std::cerr << "[MIGRATION] Key " << key << " manually assigned: "
+            << oldip_str << " -> " << newip_str
+            << "\n";
   key_override_.erase(key);
   key_override_[key] = newServer;
 }
