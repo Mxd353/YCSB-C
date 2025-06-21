@@ -90,13 +90,8 @@ class CacheMigrationDpdk : public DB {
         std::make_shared<std::promise<std::vector<KVPair>>>();
     std::shared_ptr<std::promise<bool>> write_promise =
         std::make_shared<std::promise<bool>>();
-    std::string key;
-    uint32_t daddr;
-    uint8_t op;
 
     bool completed = false;
-
-    RequestInfo() : daddr(0), op(0) {}
   };
 
   RequestMap<uint32_t, RequestInfo> request_map_;

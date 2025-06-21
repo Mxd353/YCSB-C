@@ -253,9 +253,7 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
       rte_ring *ring =
           rte_ring_create(ring_name.c_str(), TX_RING_SIZE, rte_socket_id(),
                           RING_F_MP_HTS_ENQ | RING_F_SC_DEQ);
-      // auto *ring =
-      //     rte_ring_create(ring_name.c_str(), TX_RING_SIZE, rte_socket_id(),
-      //                     RING_F_SP_ENQ | RING_F_SC_DEQ);
+
       if (ring == nullptr) {
         std::cerr << "Failed to create tx ring: " << ring_name
                   << ", Error: " << rte_strerror(rte_errno) << "\n";
@@ -306,9 +304,10 @@ void CacheMigrationDpdk::ProcessReceivedPacket(struct rte_mbuf *mbuf) {
       return;
     }
     req->completed = true;
-
+    std::string key_str(kv_header->key.begin(), kv_header->key.end());
+    const uint8_t op = GET_OP(kv_header->combined);
     try {
-      if (req->op == READ_REQUEST && req->read_promise) {
+      if (op == READ_REQUEST && req->read_promise) {
         std::vector<KVPair> data;
         data.reserve(4);
         const char *base = kv_header->value1.data();
@@ -317,12 +316,14 @@ void CacheMigrationDpdk::ProcessReceivedPacket(struct rte_mbuf *mbuf) {
                             std::string(base + i * VALUE_LENGTH, VALUE_LENGTH));
         }
         req->read_promise->set_value(std::move(data));
-      } else if (req->op == WRITE_REQUEST && req->write_promise) {
+      } else if (op == WRITE_REQUEST && req->write_promise) {
         req->write_promise->set_value(true);
+      } else {
+        throw std::runtime_error("The op and the promise do not match");
       }
 
-      if (ip_hdr->src_addr != req->daddr) {
-        consistent_hash_.MigrateKey(req->key, req->daddr, ip_hdr->src_addr);
+      if (ip_hdr->src_addr != consistent_hash_.GetServerIp(key_str)) {
+        consistent_hash_.MigrateKey(kv_header->key, ip_hdr->src_addr);
       }
     } catch (const std::future_error &e) {
       std::cerr << "[Packet] Future error: " << e.what() << std::endl;
@@ -521,11 +522,8 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
 
   auto request = std::make_shared<RequestInfo>();
   request->read_promise = read_promise;
-  request->daddr = dst_ip;
-  request->key = key;
-  request->op = READ_REQUEST;
 
-  if (!request_map_.Insert(req_id, std::move(request))) {
+  if (!request_map_.Insert(req_id, request)) {
     no_result_.fetch_add(1, std::memory_order_relaxed);
     std::cerr << "[Read]Error to insert request: " << req_id << std::endl;
     return DB::kErrorConflict;
@@ -568,7 +566,6 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
 int CacheMigrationDpdk::Insert(const std::string & /*table*/,
                                const std::string &key,
                                std::vector<KVPair> &values) {
-  // std::unique_lock<std::shared_mutex> lock(mutex_);
   const uint32_t req_id = generate_request_id();
   update_count_.fetch_add(1, std::memory_order_relaxed);
   const rte_be32_t dst_ip = consistent_hash_.GetServerIp(key);
@@ -578,11 +575,8 @@ int CacheMigrationDpdk::Insert(const std::string & /*table*/,
 
   auto request = std::make_shared<RequestInfo>();
   request->write_promise = write_promise;
-  request->daddr = dst_ip;
-  request->key = key;
-  request->op = WRITE_REQUEST;
 
-  if (!request_map_.Insert(req_id, std::move(request))) {
+  if (!request_map_.Insert(req_id, request)) {
     update_failed_.fetch_add(1, std::memory_order_relaxed);
     std::cerr << "[Insert]Error to insert request: " << req_id << std::endl;
     return DB::kErrorConflict;

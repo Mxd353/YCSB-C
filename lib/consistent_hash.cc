@@ -4,6 +4,7 @@
 #include <boost/crc.hpp>
 #include <fstream>
 #include <iostream>
+#include <mutex>
 
 #include "core/utils.h"
 
@@ -23,6 +24,7 @@ void ConsistentHash::AddServer(const std::string &ip) {
   }
   rte_be32_t ip_be = addr.s_addr;
 
+  std::unique_lock lock(rw_mutex_);
   int added_nodes = 0;
   for (int i = 0; i < virtual_node_count_; ++i) {
     std::string virtualNode = ip + "#" + std::to_string(i);
@@ -47,6 +49,8 @@ rte_be32_t ConsistentHash::FindServer(const std::string_view &key) {
     throw std::runtime_error("Hash ring is empty, no servers available.");
   }
   size_t hashValue = Hash(key);
+
+  std::shared_lock lock(rw_mutex_);
   auto it = std::lower_bound(hash_ring_.begin(), hash_ring_.end(), hashValue);
   if (it == hash_ring_.end()) {
     it = hash_ring_.begin();
@@ -76,16 +80,18 @@ ConsistentHash::ConsistentHash(const std::string &server_ip_file,
             << "\n========================================\n";
 }
 
-void ConsistentHash::MigrateKey(const std::string &key, rte_be32_t oldServer, rte_be32_t newServer) {
+void ConsistentHash::MigrateKey(const std::array<char, KEY_LENGTH> &key,
+                                rte_be32_t newServer) {
+  std::string key_str(key.begin(), key.end());
   std::string oldip_str;
-  utils::ReverseRTE_IPV4(uint32_t(oldServer), oldip_str);
+  utils::ReverseRTE_IPV4(uint32_t(FindServer(key_str)), oldip_str);
   std::string newip_str;
   utils::ReverseRTE_IPV4(uint32_t(newServer), newip_str);
-  std::cerr << "[MIGRATION] Key " << key << " manually assigned: "
-            << oldip_str << " -> " << newip_str
+  std::cerr << "[MIGRATION] Key " << key_str
+            << " manually assigned: " << oldip_str << " -> " << newip_str
             << "\n";
-  key_override_.erase(key);
-  key_override_[key] = newServer;
+  key_override_.erase(key_str);
+  key_override_[key_str] = newServer;
 }
 
 void ConsistentHash::RemoveMigration(const std::string &key) {

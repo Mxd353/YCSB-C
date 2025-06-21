@@ -19,12 +19,12 @@ class HotStatistics : public DB {
   HotStatistics()
       : outfile_("hot_statistics.output"),
         consistent_hash_("conf/server_ips.conf") {
-    key_counter_.reserve(30000);
+    key_counter_.reserve(40000);
   }
   ~HotStatistics() {
     try {
       PrintLoadedKVs();
-      PrintHotKeys();
+      PrintHotKeys(40000);
     } catch (const std::exception &e) {
       std::cerr << "Exception during Print: " << e.what() << std::endl;
     }
@@ -86,7 +86,10 @@ class HotStatistics : public DB {
     if (outfile_.is_open()) {
       outfile_ << "================ ALL KVs ================\n";
       for (auto &kv : loaded_kvs_) {
-        outfile_ << kv.first << " ";
+        std::string ip_str;
+        utils::ReverseRTE_IPV4(uint32_t(consistent_hash_.GetServerIp(kv.first)),
+                               ip_str);
+        outfile_ << ip_str << " " << kv.first << " ";
         for (auto &v : kv.second) outfile_ << v.second << " ";
         outfile_ << "\n";
       }
@@ -94,7 +97,7 @@ class HotStatistics : public DB {
     }
   }
 
-  void PrintHotKeys(size_t top_n = 10000) {
+  void PrintHotKeys(size_t top_n) {
     std::vector<std::pair<std::string, int>> vec;
     for (const auto &kv : key_counter_) {
       vec.emplace_back(kv.first, kv.second.load(std::memory_order_relaxed));
@@ -143,7 +146,7 @@ class HotStatistics : public DB {
   std::mutex counter_mutex_;
   std::mutex output_mutex_;
   std::ofstream outfile_;
-
+  const size_t CACHE_SIZE = 8192 * 3;
   ConsistentHash consistent_hash_;
 };
 }  // namespace ycsbc
