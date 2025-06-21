@@ -511,7 +511,6 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
                              const std::string &key,
                              const std::vector<std::string> * /*fields*/,
                              std::vector<KVPair> &result) {
-  // std::unique_lock<std::shared_mutex> lock(mutex_);
   const uint32_t req_id = generate_request_id();
 
   read_count_.fetch_add(1, std::memory_order_relaxed);
