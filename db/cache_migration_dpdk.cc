@@ -293,7 +293,8 @@ void CacheMigrationDpdk::ProcessReceivedPacket(struct rte_mbuf *mbuf) {
   const uint8_t is_req = GET_IS_REQ(kv_header->combined);
 
   if (is_req != CACHE_REPLY && is_req != SERVER_REPLY) {
-    std::cerr << "Server rejected request_id = " << request_id << std::endl;
+    // std::cerr << "Server" : "Cache" << "Server rejected request_id = " <<
+    // request_id << std::endl;
     return;
   }
 
@@ -331,7 +332,8 @@ void CacheMigrationDpdk::ProcessReceivedPacket(struct rte_mbuf *mbuf) {
   });
 
   if (!exist) {
-    std::cerr << "[Packet] Request not exist id: " << request_id << std::endl;
+    // std::cerr << "[Packet] Request not exist id: " << request_id <<
+    // std::endl;
   }
 }
 
@@ -463,7 +465,7 @@ inline void CacheMigrationDpdk::LaunchThreads() {
 }
 
 struct rte_mbuf *CacheMigrationDpdk::BuildRequestPacket(
-    const std::string &key, uint8_t op, rte_be32_t dst_ip, uint32_t req_id,
+    const std::string &key, uint8_t op, uint32_t req_id,
     const std::vector<KVPair> &values) {
   struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool_);
   if (!mbuf) return nullptr;
@@ -490,7 +492,7 @@ struct rte_mbuf *CacheMigrationDpdk::BuildRequestPacket(
   ip_hdr->next_proto_id = IP_PROTOCOLS_NETCACHE;
   ip_hdr->time_to_live = 64;
   ip_hdr->src_addr = src_ip_;
-  ip_hdr->dst_addr = dst_ip;
+  ip_hdr->dst_addr = consistent_hash_.GetServerIp(key);
   ip_hdr->hdr_checksum = 0;
   ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
 
@@ -514,7 +516,6 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
   const uint32_t req_id = generate_request_id();
 
   read_count_.fetch_add(1, std::memory_order_relaxed);
-  const rte_be32_t dst_ip = consistent_hash_.GetServerIp(key);
 
   auto read_promise = std::make_shared<std::promise<std::vector<KVPair>>>();
   auto future = read_promise->get_future();
@@ -533,7 +534,7 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
   try {
     for (int attempt = 0; attempt < RETRIES; ++attempt) {
       rte_mbuf *mbuf =
-          BuildRequestPacket(key, READ_REQUEST, dst_ip, req_id, DEFAULT_VALUES);
+          BuildRequestPacket(key, READ_REQUEST, req_id, DEFAULT_VALUES);
       if (!mbuf) {
         throw std::runtime_error("Failed to build request packet");
       }
@@ -545,7 +546,7 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
       }
       mbuf_guard.release();
 
-      if (future.wait_for(std::chrono::milliseconds(50)) ==
+      if (future.wait_for(std::chrono::milliseconds(100)) ==
           std::future_status::ready) {
         result = future.get();
         read_success_.fetch_add(1, std::memory_order_relaxed);
@@ -567,7 +568,7 @@ int CacheMigrationDpdk::Insert(const std::string & /*table*/,
                                std::vector<KVPair> &values) {
   const uint32_t req_id = generate_request_id();
   update_count_.fetch_add(1, std::memory_order_relaxed);
-  const rte_be32_t dst_ip = consistent_hash_.GetServerIp(key);
+  // const rte_be32_t dst_ip = consistent_hash_.GetServerIp(key);
 
   auto write_promise = std::make_shared<std::promise<bool>>();
   auto future = write_promise->get_future();
@@ -585,8 +586,7 @@ int CacheMigrationDpdk::Insert(const std::string & /*table*/,
 
   try {
     for (int attempt = 0; attempt < RETRIES; ++attempt) {
-      rte_mbuf *mbuf =
-          BuildRequestPacket(key, WRITE_REQUEST, dst_ip, req_id, values);
+      rte_mbuf *mbuf = BuildRequestPacket(key, WRITE_REQUEST, req_id, values);
       if (!mbuf) {
         throw std::runtime_error("Failed to build request packet");
       }
@@ -598,7 +598,7 @@ int CacheMigrationDpdk::Insert(const std::string & /*table*/,
       }
       mbuf_guard.release();
 
-      if (future.wait_for(std::chrono::milliseconds(50)) ==
+      if (future.wait_for(std::chrono::milliseconds(100)) ==
           std::future_status::ready) {
         if (future.get()) {
           update_success_.fetch_add(1, std::memory_order_relaxed);

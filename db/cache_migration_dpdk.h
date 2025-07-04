@@ -10,8 +10,8 @@
 
 #include "core/db.h"
 #include "lib/c_m_proto.h"
-#include "lib/request_map.h"
 #include "lib/consistent_hash.h"
+#include "lib/request_map.h"
 
 #define NUM_MBUFS 16384
 #define MBUF_CACHE_SIZE 512
@@ -100,7 +100,7 @@ class CacheMigrationDpdk : public DB {
   int PortInit(uint16_t port);
   inline void LaunchThreads();
   struct rte_mbuf *BuildRequestPacket(const std::string &key, uint8_t op,
-                                      rte_be32_t dst_ip, uint32_t req_id,
+                                      uint32_t req_id,
                                       const std::vector<KVPair> &values);
 
   void ProcessReceivedPacket(struct rte_mbuf *mbuf);
