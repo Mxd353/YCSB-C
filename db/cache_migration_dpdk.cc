@@ -39,9 +39,9 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
     : num_threads_(num_threads), consistent_hash_("conf/server_ips.conf") {
   std::vector<std::string> args;
   std::string dpdk_conf = "conf/dpdk.conf";
-  std::ifstream file(dpdk_conf);
-  std::string veth_config = "conf/veths_config.conf";
-  std::ifstream veth_file(veth_config);
+  std::ifstream dpdk_file(dpdk_conf);
+  std::string client_conf = "conf/client_config.conf";
+  std::ifstream client_file(client_conf);
   std::string token;
 
   char *program_name = __progname;
@@ -52,7 +52,7 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
   //  args.push_back("-l");
   //  args.push_back("0-" + std::to_string(num_threads));
 
-  while (file >> token) {
+  while (dpdk_file >> token) {
     args.push_back(token);
   }
   std::vector<char *> argv;
@@ -69,11 +69,11 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
 
   std::cout << "++++++++db initialization++++++++\n";
   std::string line;
-  while (std::getline(veth_file, line)) {
-    std::string veth, ip_str;
+  while (std::getline(client_file, line)) {
+    std::string ip_str;
     u_int dev_id;
     std::istringstream iss(line);
-    if (iss >> veth >> ip_str >> dev_id) {
+    if (iss >> ip_str >> dev_id) {
       src_ips_.emplace_back(inet_addr(ip_str.c_str()), dev_id);
       std::cout << "Add ip: " << ip_str << " | dev_id: " << dev_id << "\n";
     } else {
@@ -525,7 +525,7 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
 
   if (!request_map_.Insert(req_id, request)) {
     no_result_.fetch_add(1, std::memory_order_relaxed);
-    std::cerr << "[Read]Error to insert request: " << req_id << std::endl;
+    std::cerr << "[Read] Error to insert request: " << req_id << std::endl;
     return DB::kErrorConflict;
   }
 
@@ -556,7 +556,7 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
     }
     throw std::runtime_error("Max retries exceeded");
   } catch (const std::exception &e) {
-    std::cerr << "Error in Read: " << e.what() << ", req_id: " << req_id
+    std::cerr << "[Read] Error: " << e.what() << ", req_id: " << req_id
               << std::endl;
     no_result_.fetch_add(1, std::memory_order_relaxed);
     return DB::kErrorNoData;
@@ -578,7 +578,7 @@ int CacheMigrationDpdk::Insert(const std::string & /*table*/,
 
   if (!request_map_.Insert(req_id, request)) {
     update_failed_.fetch_add(1, std::memory_order_relaxed);
-    std::cerr << "[Insert]Error to insert request: " << req_id << std::endl;
+    std::cerr << "[Insert] Error to insert request: " << req_id << std::endl;
     return DB::kErrorConflict;
   }
 
@@ -611,7 +611,7 @@ int CacheMigrationDpdk::Insert(const std::string & /*table*/,
     }
     throw std::runtime_error("Max retries exceeded");
   } catch (const std::exception &e) {
-    std::cerr << "Error in Insert: " << e.what() << ", req_id: " << req_id
+    std::cerr << "[Insert] Error: " << e.what() << ", req_id: " << req_id
               << std::endl;
     update_failed_.fetch_add(1, std::memory_order_relaxed);
     return DB::kErrorNoData;
