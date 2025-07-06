@@ -1,12 +1,19 @@
-def get_dev_id(ip):
-    if ip.startswith('192.168.7.'):
-        return 0
-    elif ip.startswith('192.168.8.'):
-        return 1
-    elif ip.startswith('192.168.9.'):
-        return 2
-    else:
+LEAF_SIZE = 32
+LEAVES = [i for i in range(LEAF_SIZE)]
+
+def get_rack(ip_str):
+    parts = ip_str.strip().split(".")
+    if len(parts) != 4:
         return -1
+    try:
+        third_octet = int(parts[2])
+    except ValueError:
+        return -1
+
+    rack_index = third_octet - 7
+    if 0 <= rack_index < LEAF_SIZE:
+        return LEAVES[rack_index]
+    return -1
 
 with open("hot_statistics.output", "r") as infile, open("hot_keys.output", "w") as outfile:
     for line in infile:
@@ -15,5 +22,5 @@ with open("hot_statistics.output", "r") as infile, open("hot_keys.output", "w") 
             continue
         ip = parts[0]
         key = parts[1]
-        dev_id = get_dev_id(ip)
+        dev_id = get_rack(ip)
         outfile.write(f"{dev_id} {key}\n")
