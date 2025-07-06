@@ -16,8 +16,8 @@ fi
 
 export LD_LIBRARY_PATH="$GCC_HOME/lib64:$BOOST_HOME/lib:$RTE_SDK/lib/x86_64-linux-gnu:$LD_LIBRARY_PATH"
 
-echo "[INFO] 使用的 LD_LIBRARY_PATH:"
-echo "       $LD_LIBRARY_PATH"
+# echo "[INFO] 使用的 LD_LIBRARY_PATH:"
+# echo "       $LD_LIBRARY_PATH"
 
 if [[ ! -f "./build/ycsbc" ]]; then
     echo "[ERROR] 找不到可执行文件 ./build/ycsbc"
