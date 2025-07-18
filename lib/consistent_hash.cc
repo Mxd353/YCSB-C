@@ -87,9 +87,9 @@ void ConsistentHash::MigrateKey(const std::array<char, KEY_LENGTH> &key,
   utils::ReverseRTE_IPV4(uint32_t(FindServer(key_str)), oldip_str);
   std::string newip_str;
   utils::ReverseRTE_IPV4(uint32_t(newServer), newip_str);
-  std::cerr << "[MIGRATION] Key " << key_str
-            << " manually assigned: " << oldip_str << " -> " << newip_str
-            << "\n";
+  // std::cerr << "[MIGRATION] Key " << key_str
+  //           << " manually assigned: " << oldip_str << " -> " << newip_str
+  //           << "\n";
   key_override_.erase(key_str);
   key_override_[key_str] = newServer;
 }
