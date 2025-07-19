@@ -8,6 +8,7 @@
 #include <sstream>
 #include <thread>
 
+#include "core/timer.h"
 #include "core/utils.h"
 
 extern char *__progname;
@@ -19,21 +20,16 @@ std::atomic<bool> running{false};
 thread_local static int assigned_ring_id = -1;
 thread_local static rte_ring *assigned_ring = nullptr;
 
-static inline uint32_t generate_request_id() {
-  static std::atomic<uint32_t> counter{0};
-  return counter.fetch_add(1, std::memory_order_relaxed);
-}
-
 static inline void exponentialBackoff(int attempt) {
-  int wait_ms = std::min(500 * (1 << (attempt - 1)), 4000);
-  if (attempt == 0) wait_ms = 0;
-
+  int wait_ms = std::min(20 * (1 << (attempt - 1)), 500);
   std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
 }
 
 namespace ycsbc {
 thread_local rte_be32_t CacheMigrationDpdk::src_ip_ = 0;
 thread_local uint CacheMigrationDpdk::dev_id_ = 0;
+
+thread_local CacheMigrationDpdk::ThreadStats thread_stats;
 
 CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
     : num_threads_(num_threads), consistent_hash_("conf/server_ips.conf") {
@@ -43,6 +39,8 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
   std::string client_conf = "conf/client_config.conf";
   std::ifstream client_file(client_conf);
   std::string token;
+
+  all_thread_stats_.reserve(num_threads);
 
   char *program_name = __progname;
 
@@ -89,14 +87,17 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
     return;
   }
 
-  mbuf_pool_ = rte_pktmbuf_pool_create(
-      "MBUF_POOL", NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
-      RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
-  if (mbuf_pool_ == NULL) {
-    std::cerr << "Failed to create mbuf pool , Error: "
-              << rte_strerror(rte_errno) << std::endl;
-    rte_exit(EXIT_FAILURE, "Cannot create mbuf pool\n");
-  }
+  tx_mbufpool_ = rte_pktmbuf_pool_create(
+      "TX_MBUF_POOL", NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE,
+      RTE_MBUF_PRIV_ALIGN, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+  if (tx_mbufpool_ == NULL)
+    rte_exit(EXIT_FAILURE, "Cannot create TX_MBUF_POOL\n");
+
+  rx_mbufpool_ = rte_pktmbuf_pool_create(
+      "RX_MBUF_POOL", NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE,
+      RTE_MBUF_PRIV_ALIGN, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+  if (rx_mbufpool_ == NULL)
+    rte_exit(EXIT_FAILURE, "Cannot create RX_MBUF_POOL\n");
 
   AssignCores();
 
@@ -133,11 +134,14 @@ CacheMigrationDpdk::~CacheMigrationDpdk() {
     core.rings.clear();
   }
 
-  if (mbuf_pool_) {
-    rte_mempool_free(mbuf_pool_);
-    mbuf_pool_ = nullptr;
+  if (tx_mbufpool_) {
+    rte_mempool_free(tx_mbufpool_);
+    tx_mbufpool_ = nullptr;
   }
-
+  if (rx_mbufpool_) {
+    rte_mempool_free(rx_mbufpool_);
+    rx_mbufpool_ = nullptr;
+  }
   request_map_.Clear();
 
   std::cout << "CacheMigrationDpdk resources cleaned up." << std::endl;
@@ -169,7 +173,12 @@ void CacheMigrationDpdk::Init() {
   initialized = true;
 }
 
-void CacheMigrationDpdk::Close() {}
+void CacheMigrationDpdk::Close() {
+  {
+    std::lock_guard<std::mutex> lock(stats_mutex);
+    all_thread_stats_.push_back(thread_stats);
+  }
+}
 
 inline void CacheMigrationDpdk::AssignCores() {
   uint lcore_id;
@@ -192,7 +201,7 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
   uint16_t nb_rx_cores = rx_cores_.size();
   uint16_t nb_tx_cores = tx_cores_.size();
 
-  if (mbuf_pool_ == NULL) {
+  if (tx_mbufpool_ == NULL || rx_mbufpool_ == NULL) {
     printf("mbuf_pool is NULL!\n");
     return -1;
   }
@@ -230,7 +239,7 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
 
   for (uint16_t q = 0; q < nb_rx_cores; ++q) {
     retval = rte_eth_rx_queue_setup(
-        port, q, nb_rxd, rte_eth_dev_socket_id(port), nullptr, mbuf_pool_);
+        port, q, nb_rxd, rte_eth_dev_socket_id(port), nullptr, rx_mbufpool_);
     if (retval < 0) return retval;
     rx_cores_[q].second = q;
   }
@@ -467,7 +476,7 @@ inline void CacheMigrationDpdk::LaunchThreads() {
 struct rte_mbuf *CacheMigrationDpdk::BuildRequestPacket(
     const std::string &key, uint8_t op, uint32_t req_id,
     const std::vector<KVPair> &values) {
-  struct rte_mbuf *mbuf = rte_pktmbuf_alloc(mbuf_pool_);
+  struct rte_mbuf *mbuf = rte_pktmbuf_alloc(tx_mbufpool_);
   if (!mbuf) return nullptr;
 
   char *pkt_data = rte_pktmbuf_append(mbuf, TOTAL_LEN);
@@ -513,7 +522,7 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
                              const std::string &key,
                              const std::vector<std::string> * /*fields*/,
                              std::vector<KVPair> &result) {
-  const uint32_t req_id = generate_request_id();
+  const uint32_t req_id = utils::generate_request_id();
 
   read_count_.fetch_add(1, std::memory_order_relaxed);
 
@@ -541,6 +550,9 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
 
       std::unique_ptr<rte_mbuf, decltype(&rte_pktmbuf_free)> mbuf_guard(
           mbuf, rte_pktmbuf_free);
+
+      uint64_t start_us = get_now_micros();
+
       if (rte_ring_enqueue(assigned_ring, mbuf) < 0) {
         throw std::runtime_error("Failed to enqueue packet");
       }
@@ -548,6 +560,10 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
 
       if (future.wait_for(std::chrono::milliseconds(100)) ==
           std::future_status::ready) {
+        auto elapsed = get_now_micros() - start_us;
+        thread_stats.total_latency_us += elapsed;
+        thread_stats.completed_requests++;
+
         result = future.get();
         read_success_.fetch_add(1, std::memory_order_relaxed);
         return DB::kOK;
@@ -566,7 +582,7 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
 int CacheMigrationDpdk::Insert(const std::string & /*table*/,
                                const std::string &key,
                                std::vector<KVPair> &values) {
-  const uint32_t req_id = generate_request_id();
+  const uint32_t req_id = utils::generate_request_id();
   update_count_.fetch_add(1, std::memory_order_relaxed);
   // const rte_be32_t dst_ip = consistent_hash_.GetServerIp(key);
 
@@ -593,6 +609,9 @@ int CacheMigrationDpdk::Insert(const std::string & /*table*/,
 
       std::unique_ptr<rte_mbuf, decltype(&rte_pktmbuf_free)> mbuf_guard(
           mbuf, rte_pktmbuf_free);
+
+      uint64_t start_us = get_now_micros();
+
       if (rte_ring_enqueue(assigned_ring, mbuf) < 0) {
         throw std::runtime_error("Failed to enqueue packet");
       }
@@ -601,6 +620,10 @@ int CacheMigrationDpdk::Insert(const std::string & /*table*/,
       if (future.wait_for(std::chrono::milliseconds(100)) ==
           std::future_status::ready) {
         if (future.get()) {
+          auto elapsed = get_now_micros() - start_us;
+          thread_stats.total_latency_us += elapsed;
+          thread_stats.completed_requests++;
+
           update_success_.fetch_add(1, std::memory_order_relaxed);
           return DB::kOK;
         } else {
@@ -636,7 +659,24 @@ int CacheMigrationDpdk::Delete(const std::string &table,
 }
 
 void CacheMigrationDpdk::PrintStats() {
+  uint64_t total_ops = 0;
+  uint64_t total_latency_us = 0;
+  for (const auto &s : all_thread_stats_) {
+    total_ops += s.completed_requests;
+    total_latency_us += s.total_latency_us;
+  }
+
+  const double avg_latency_us =
+      total_ops > 0 ? static_cast<double>(total_latency_us) / total_ops : 0.0;
+  const double total_time_sec =
+      total_latency_us > 0 ? total_latency_us / 1'000'000.0 : 0.0;
+
+  const double iops = total_time_sec > 0 ? total_ops / total_time_sec : 0.0;
+
   std::cout << "[Stats] CacheMigrationDpdk Statistics:\n"
+            << "Total Ops: " << total_ops
+            << ", Avg Latency (us): " << avg_latency_us << " us, IOPS: " << iops
+            << "\n"
             << "  Total Reads: " << read_count_.load() << "\n"
             << "  Successful Reads: " << read_success_.load() << "\n"
             << "  No Result Reads: " << no_result_.load() << "\n"

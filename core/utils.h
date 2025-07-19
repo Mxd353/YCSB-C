@@ -10,6 +10,7 @@
 #define YCSB_C_UTILS_H_
 
 #include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <exception>
 #include <random>
@@ -83,6 +84,11 @@ inline void ReverseRTE_IPV4(uint32_t ip, std::string &result) {
 
   result = std::to_string(d) + "." + std::to_string(c) + "." +
            std::to_string(b) + "." + std::to_string(a);
+}
+
+static inline uint32_t generate_request_id() {
+  static std::atomic<uint32_t> counter{0};
+  return counter.fetch_add(1, std::memory_order_relaxed);
 }
 
 }  // namespace utils
