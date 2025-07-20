@@ -540,22 +540,22 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
 
   RequestCleaner cleaner(request_map_, req_id);
 
+  rte_mbuf *mbuf =
+      BuildRequestPacket(key, READ_REQUEST, req_id, DEFAULT_VALUES);
+  if (!mbuf) {
+    no_result_.fetch_add(1, std::memory_order_relaxed);
+    return DB::kErrorNoData;
+  }
+  std::unique_ptr<rte_mbuf, decltype(&rte_pktmbuf_free)> mbuf_guard(
+      mbuf, rte_pktmbuf_free);
+
   try {
     for (int attempt = 0; attempt < RETRIES; ++attempt) {
-      rte_mbuf *mbuf =
-          BuildRequestPacket(key, READ_REQUEST, req_id, DEFAULT_VALUES);
-      if (!mbuf) {
-        throw std::runtime_error("Failed to build request packet");
-      }
-
-      std::unique_ptr<rte_mbuf, decltype(&rte_pktmbuf_free)> mbuf_guard(
-          mbuf, rte_pktmbuf_free);
-
       uint64_t start_us = get_now_micros();
 
-      if (rte_ring_enqueue(assigned_ring, mbuf) < 0) {
+      if (rte_ring_enqueue(assigned_ring, mbuf) < 0)
         throw std::runtime_error("Failed to enqueue packet");
-      }
+
       mbuf_guard.release();
 
       if (future.wait_for(std::chrono::milliseconds(100)) ==
@@ -568,6 +568,9 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
         read_success_.fetch_add(1, std::memory_order_relaxed);
         return DB::kOK;
       }
+      mbuf = BuildRequestPacket(key, READ_REQUEST, req_id, DEFAULT_VALUES);
+      if (!mbuf) throw std::runtime_error("Rebuild packet failed");
+      mbuf_guard.reset(mbuf);
       exponentialBackoff(attempt);
     }
     throw std::runtime_error("Max retries exceeded");
@@ -584,7 +587,6 @@ int CacheMigrationDpdk::Insert(const std::string & /*table*/,
                                std::vector<KVPair> &values) {
   const uint32_t req_id = utils::generate_request_id();
   update_count_.fetch_add(1, std::memory_order_relaxed);
-  // const rte_be32_t dst_ip = consistent_hash_.GetServerIp(key);
 
   auto write_promise = std::make_shared<std::promise<bool>>();
   auto future = write_promise->get_future();
@@ -600,16 +602,16 @@ int CacheMigrationDpdk::Insert(const std::string & /*table*/,
 
   RequestCleaner cleaner(request_map_, req_id);
 
+  rte_mbuf *mbuf = BuildRequestPacket(key, WRITE_REQUEST, req_id, values);
+  if (!mbuf) {
+    throw std::runtime_error("Failed to build request packet");
+  }
+
+  std::unique_ptr<rte_mbuf, decltype(&rte_pktmbuf_free)> mbuf_guard(
+      mbuf, rte_pktmbuf_free);
+
   try {
     for (int attempt = 0; attempt < RETRIES; ++attempt) {
-      rte_mbuf *mbuf = BuildRequestPacket(key, WRITE_REQUEST, req_id, values);
-      if (!mbuf) {
-        throw std::runtime_error("Failed to build request packet");
-      }
-
-      std::unique_ptr<rte_mbuf, decltype(&rte_pktmbuf_free)> mbuf_guard(
-          mbuf, rte_pktmbuf_free);
-
       uint64_t start_us = get_now_micros();
 
       if (rte_ring_enqueue(assigned_ring, mbuf) < 0) {
@@ -630,6 +632,9 @@ int CacheMigrationDpdk::Insert(const std::string & /*table*/,
           return DB::kErrorRejected;
         }
       }
+      mbuf = BuildRequestPacket(key, WRITE_REQUEST, req_id, values);
+      if (!mbuf) throw std::runtime_error("Rebuild packet failed");
+      mbuf_guard.reset(mbuf);
       exponentialBackoff(attempt);
     }
     throw std::runtime_error("Max retries exceeded");
