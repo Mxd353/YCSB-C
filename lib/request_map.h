@@ -41,6 +41,14 @@ class RequestMap {
     return false;
   }
 
+  template <typename Fn>
+  void ForEach(Fn&& fn) const {
+    std::shared_lock lock(map_mutex_);
+    for (const auto& [key, value] : map_) {
+      fn(key, *value);
+    }
+  }
+
   bool Erase(U req_id) noexcept {
     std::unique_lock<std::shared_mutex> lock(map_mutex_);
     return map_.unsafe_erase(req_id) > 0;

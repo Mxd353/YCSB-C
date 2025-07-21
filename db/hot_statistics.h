@@ -44,7 +44,7 @@ class HotStatistics : public DB {
     }
   }
 
-  void Init() {
+  void Init(const int /*thread_id*/, const int /*num_ops*/) {
     std::lock_guard<std::mutex> lock(output_mutex_);
     std::cout << "A new thread begins working." << std::endl;
   }

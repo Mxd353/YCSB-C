@@ -1,5 +1,6 @@
 #include "cache_migration_dpdk.h"
 
+#include <algorithm>
 #include <bitset>
 #include <chrono>
 #include <fstream>
@@ -15,10 +16,10 @@ extern char *__progname;
 
 static const std::string field_names[4] = {"field0", "field1", "field2",
                                            "field3"};
-std::atomic<bool> running{false};
 
-thread_local static int assigned_ring_id = -1;
-thread_local static rte_ring *assigned_ring = nullptr;
+static std::vector<std::vector<rte_mbuf *>> packets;
+uint64_t send_start_us = 0;
+std::atomic<bool> running{false};
 
 static inline void exponentialBackoff(int attempt) {
   int wait_ms = std::min(20 * (1 << (attempt - 1)), 500);
@@ -28,7 +29,7 @@ static inline void exponentialBackoff(int attempt) {
 namespace ycsbc {
 thread_local rte_be32_t CacheMigrationDpdk::src_ip_ = 0;
 thread_local uint CacheMigrationDpdk::dev_id_ = 0;
-
+thread_local int CacheMigrationDpdk::thread_id_ = 0;
 thread_local CacheMigrationDpdk::ThreadStats thread_stats;
 
 CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
@@ -41,9 +42,9 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
   std::string token;
 
   all_thread_stats_.reserve(num_threads);
+  packets.reserve(num_threads);
 
   char *program_name = __progname;
-
   args.push_back(program_name);
 
   // 动态核数
@@ -112,8 +113,6 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
   }
 
   std::cout << "+++++++++++++++++++++++++++++++++\n";
-  running = true;
-  LaunchThreads();
 }
 
 CacheMigrationDpdk::~CacheMigrationDpdk() {
@@ -123,16 +122,6 @@ CacheMigrationDpdk::~CacheMigrationDpdk() {
   uint16_t port = 0;
   rte_eth_dev_stop(port);
   rte_eth_dev_close(port);
-
-  for (auto &core : tx_cores_) {
-    for (auto &ring : core.rings) {
-      if (ring) {
-        rte_ring_free(ring);
-        ring = nullptr;
-      }
-    }
-    core.rings.clear();
-  }
 
   if (tx_mbufpool_) {
     rte_mempool_free(tx_mbufpool_);
@@ -145,38 +134,34 @@ CacheMigrationDpdk::~CacheMigrationDpdk() {
   request_map_.Clear();
 
   std::cout << "CacheMigrationDpdk resources cleaned up." << std::endl;
-};
+}
 
-void CacheMigrationDpdk::Init() {
+void CacheMigrationDpdk::Init(const int thread_id, const int num_ops) {
   static thread_local bool initialized = false;
   if (initialized) return;
+  thread_id_ = thread_id;
+  auto &pkts = packets[thread_id_];
+  pkts.reserve(num_ops);
+
+  total_request_count_.fetch_add(num_ops, std::memory_order_relaxed);
 
   auto selected = src_ips_[rte_rand_max(src_ips_size_)];
   src_ip_ = selected.first;
   dev_id_ = selected.second;
 
-  auto t_id = std::this_thread::get_id();
-  std::hash<std::thread::id> hasher;
-
-  int tx_core_index = hasher(t_id) % tx_cores_.size();
-  TxConf &core_conf = tx_cores_[tx_core_index];
-
-  assigned_ring_id = hasher(t_id) % core_conf.rings.size();
-  assigned_ring = core_conf.rings[assigned_ring_id];
-
-  if (!assigned_ring) {
-    std::cerr << "Failed to get ring[" << assigned_ring_id << "] from TX core "
-              << tx_core_index << ": " << rte_strerror(rte_errno) << "\n";
-    return;
-  }
-
   initialized = true;
 }
 
-void CacheMigrationDpdk::Close() {
-  {
-    std::lock_guard<std::mutex> lock(stats_mutex);
-    all_thread_stats_.push_back(thread_stats);
+void CacheMigrationDpdk::Close() {}
+
+void CacheMigrationDpdk::StartDpdk() {
+  std::cout << "start DPDK.." << std::endl;
+  running = true;
+  timeout_thread_ =
+      std::thread(&CacheMigrationDpdk::TimeoutMonitorThread, this);
+  LaunchThreads();
+  while (completed_count_ + timeout_count_ < total_request_count_) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 }
 
@@ -252,29 +237,7 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
     if (retval < 0) return retval;
 
     tx_cores_[q].queue_id = q;
-    const int rings_per_core = (TX_RING_COUNT + nb_tx_cores - 1) / nb_tx_cores;
-    for (int i = 0; i < rings_per_core; ++i) {
-      std::string ring_name = "tx_ring_p" + std::to_string(getpid()) + "_c" +
-                              std::to_string(q) + "_i" + std::to_string(i);
-      struct rte_ring *old_ring = rte_ring_lookup(ring_name.c_str());
-      if (old_ring) rte_ring_free(old_ring);
-
-      rte_ring *ring =
-          rte_ring_create(ring_name.c_str(), TX_RING_SIZE, rte_socket_id(),
-                          RING_F_MP_HTS_ENQ | RING_F_SC_DEQ);
-
-      if (ring == nullptr) {
-        std::cerr << "Failed to create tx ring: " << ring_name
-                  << ", Error: " << rte_strerror(rte_errno) << "\n";
-        for (auto &r : tx_cores_[q].rings) rte_ring_free(r);
-        return -1;
-      }
-      tx_cores_[q].rings.push_back(ring);
-    }
-    std::cout << "Create " << tx_cores_[q].rings.size()
-              << " rings for lcore: " << tx_cores_[q].lcore_id << "\n";
   }
-
   retval = rte_eth_dev_start(port);
   if (retval < 0) return retval;
 
@@ -287,7 +250,7 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
 }
 
 void CacheMigrationDpdk::ProcessReceivedPacket(struct rte_mbuf *mbuf) {
-  uint64_t completed_us = get_now_micros();
+  uint64_t recv_tsc = get_now_micros();
   struct rte_ether_hdr *eth_hdr =
       rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
   if (eth_hdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) return;
@@ -314,22 +277,16 @@ void CacheMigrationDpdk::ProcessReceivedPacket(struct rte_mbuf *mbuf) {
                 << std::endl;
       return;
     }
+    completed_count_.fetch_add(1, std::memory_order_relaxed);
     req->completed = true;
-    req->completed_us = completed_us;
+    req->completed_us = recv_tsc;
     std::string key_str(kv_header->key.begin(), kv_header->key.end());
     const uint8_t op = GET_OP(kv_header->combined);
     try {
-      if (op == READ_REQUEST && req->read_promise) {
-        std::vector<KVPair> data;
-        data.reserve(4);
-        const char *base = kv_header->value1.data();
-        for (uint i = 0; i < 4; i++) {
-          data.emplace_back(field_names[i],
-                            std::string(base + i * VALUE_LENGTH, VALUE_LENGTH));
-        }
-        req->read_promise->set_value(std::move(data));
-      } else if (op == WRITE_REQUEST && req->write_promise) {
-        req->write_promise->set_value(true);
+      if (op == READ_REQUEST) {
+        read_success_.fetch_add(1, std::memory_order_relaxed);
+      } else if (op == WRITE_REQUEST) {
+        update_success_.fetch_add(1, std::memory_order_relaxed);
       } else {
         throw std::runtime_error("The op and the promise do not match");
       }
@@ -341,10 +298,47 @@ void CacheMigrationDpdk::ProcessReceivedPacket(struct rte_mbuf *mbuf) {
       std::cerr << "[Packet] Future error: " << e.what() << std::endl;
     }
   });
+  if (exist) {
+    request_map_.Erase(request_id);
+  }
+}
 
-  if (!exist) {
-    // std::cerr << "[Packet] Request not exist id: " << request_id <<
-    // std::endl;
+void CacheMigrationDpdk::TimeoutMonitorThread() {
+  const uint64_t timeout_us = 20000;
+
+  while (running) {
+    uint64_t now = get_now_micros();
+    std::vector<uint32_t> expired_requests;
+
+    request_map_.ForEach([&](uint32_t req_id, const RequestInfo &req) {
+      if (!req.completed && now - req.start_us > timeout_us) {
+        expired_requests.push_back(req_id);
+      }
+    });
+
+    for (auto req_id : expired_requests) {
+      request_map_.Modify(req_id, [&](std::shared_ptr<RequestInfo> &req) {
+        if (req->completed) return;
+
+        if (req->retry_count >= RETRIES) {
+          timeout_count_.fetch_add(1, std::memory_order_relaxed);
+          req->completed = true;
+          request_map_.Erase(req_id);
+          std::cerr << "Request timeout: " << req_id << std::endl;
+          if (req->mbuf) {
+            rte_pktmbuf_free(req->mbuf);
+            req->mbuf = nullptr;
+          }
+        } else {
+          int sent = rte_eth_tx_burst(0, 0, &req->mbuf, 1);
+          if (sent == 1) {
+            req->retry_count++;
+            req->start_us = now;
+          }
+        }
+      });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
 }
 
@@ -395,36 +389,29 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
 
 inline int CacheMigrationDpdk::TxMain(void *arg) {
   TxConf *ctx = static_cast<TxConf *>(arg);
-  struct rte_mbuf *bufs[BURST_SIZE];
-  uint nb_deq;
-  uint16_t nb_tx;
-  auto rings = ctx->rings;
-  for (auto &ring : rings) {
-    if (ring == nullptr) {
-      std::cerr << "Ring is null in TxMain\n";
-      return -1;
-    }
-  }
+  struct rte_mbuf *burst[BURST_SIZE];
+
+  auto &pkts = packets[ctx->packets_index];
+
   uint16_t queue_id = ctx->queue_id;
-  while (running.load(std::memory_order_acquire)) {
-    bool got_pkts = false;
-    for (auto *ring : rings) {
-      nb_deq = rte_ring_dequeue_burst(ring, (void **)bufs, BURST_SIZE, NULL);
-      if (nb_deq == 0) {
-        continue;
-      }
-      got_pkts = true;
+  size_t sent_count = 0;
+  size_t total_pkts = pkts.size();
 
-      nb_tx = rte_eth_tx_burst(0, queue_id, bufs, nb_deq);
-      for (uint16_t i = nb_tx; i < nb_deq; i++) {
-        rte_pktmbuf_free(bufs[i]);
-      }
-    }
+  send_start_us = get_now_micros();
 
-    if (!got_pkts) {
-      rte_pause();
+  for (size_t i = 0; i < pkts.size(); i += BURST_SIZE) {
+    size_t this_burst =
+        std::min(static_cast<unsigned long>(BURST_SIZE), pkts.size() - i);
+
+    std::memcpy(burst, &pkts[i], this_burst * sizeof(rte_mbuf *));
+
+    uint16_t nb_tx = rte_eth_tx_burst(0, queue_id, burst, this_burst);
+    for (uint16_t i = nb_tx; i < this_burst; i++) {
+      rte_pktmbuf_free(burst[i]);
     }
+    sent_count += this_burst;
   }
+  pkts.erase(pkts.begin(), pkts.begin() + sent_count);
   return 0;
 }
 
@@ -450,20 +437,15 @@ inline void CacheMigrationDpdk::LaunchThreads() {
     }
   }
 
+  int packets_index = 0;
   for (auto &core : tx_cores_) {
     uint lcore_id = core.lcore_id;
     uint16_t queue_id = core.queue_id;
-    auto rings = core.rings;
-    for (auto *ring : rings) {
-      if (ring == nullptr) {
-        std::cerr << "Ring is null in TxMain\n";
-        return;
-      }
-    }
+
     auto tx_conf = std::make_unique<TxConf>();
     tx_conf->lcore_id = lcore_id;
     tx_conf->queue_id = queue_id;
-    tx_conf->rings = std::move(rings);
+    tx_conf->packets_index = packets_index++;
 
     tx_args_.push_back(std::move(tx_conf));
     int ret = rte_eal_remote_launch(TxMain, tx_args_.back().get(), lcore_id);
@@ -523,24 +505,11 @@ struct rte_mbuf *CacheMigrationDpdk::BuildRequestPacket(
 int CacheMigrationDpdk::Read(const std::string & /*table*/,
                              const std::string &key,
                              const std::vector<std::string> * /*fields*/,
-                             std::vector<KVPair> &result) {
+                             std::vector<KVPair> & /*result*/) {
   const uint32_t req_id = utils::generate_request_id();
+  auto &pkts = packets[thread_id_];
 
   read_count_.fetch_add(1, std::memory_order_relaxed);
-
-  auto read_promise = std::make_shared<std::promise<std::vector<KVPair>>>();
-  auto future = read_promise->get_future();
-
-  auto request = std::make_shared<RequestInfo>();
-  request->read_promise = read_promise;
-
-  if (!request_map_.Insert(req_id, request)) {
-    no_result_.fetch_add(1, std::memory_order_relaxed);
-    std::cerr << "[Read] Error to insert request: " << req_id << std::endl;
-    return DB::kErrorConflict;
-  }
-
-  RequestCleaner cleaner(request_map_, req_id);
 
   rte_mbuf *mbuf =
       BuildRequestPacket(key, READ_REQUEST, req_id, DEFAULT_VALUES);
@@ -548,68 +517,31 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
     no_result_.fetch_add(1, std::memory_order_relaxed);
     return DB::kErrorNoData;
   }
+
   std::unique_ptr<rte_mbuf, decltype(&rte_pktmbuf_free)> mbuf_guard(
       mbuf, rte_pktmbuf_free);
+  pkts.push_back(mbuf);
+  mbuf_guard.release();
 
-  try {
-    for (int attempt = 0; attempt < RETRIES; ++attempt) {
-      uint64_t start_us = get_now_micros();
+  auto request = std::make_shared<RequestInfo>();
+  request->start_us = get_now_micros();
+  request->mbuf = mbuf;
 
-      if (rte_ring_enqueue(assigned_ring, mbuf) < 0)
-        throw std::runtime_error("Failed to enqueue packet");
-
-      mbuf_guard.release();
-
-      if (future.wait_for(std::chrono::milliseconds(100)) ==
-          std::future_status::ready) {
-        uint64_t latency_us = 0;
-        bool found = request_map_.Visit(req_id, [&](const auto &req) {
-          latency_us = req->completed_us - start_us;
-        });
-        if (!found) {
-          std::cerr << "Request not found when computing latency\n";
-          return DB::kErrorNoData;
-        }
-        thread_stats.total_latency_us += latency_us;
-        thread_stats.completed_requests++;
-
-        result = future.get();
-        read_success_.fetch_add(1, std::memory_order_relaxed);
-        return DB::kOK;
-      }
-      mbuf = BuildRequestPacket(key, READ_REQUEST, req_id, DEFAULT_VALUES);
-      if (!mbuf) throw std::runtime_error("Rebuild packet failed");
-      mbuf_guard.reset(mbuf);
-      exponentialBackoff(attempt);
-    }
-    throw std::runtime_error("Max retries exceeded");
-  } catch (const std::exception &e) {
-    std::cerr << "[Read] Error: " << e.what() << ", req_id: " << req_id
-              << std::endl;
+  if (!request_map_.Insert(req_id, request)) {
     no_result_.fetch_add(1, std::memory_order_relaxed);
-    return DB::kErrorNoData;
+    std::cerr << "[Read] Error to insert request: " << req_id << std::endl;
+    return DB::kErrorConflict;
   }
+  return DB::kOK;
 }
 
 int CacheMigrationDpdk::Insert(const std::string & /*table*/,
                                const std::string &key,
                                std::vector<KVPair> &values) {
   const uint32_t req_id = utils::generate_request_id();
+  auto &pkts = packets[thread_id_];
+
   update_count_.fetch_add(1, std::memory_order_relaxed);
-
-  auto write_promise = std::make_shared<std::promise<bool>>();
-  auto future = write_promise->get_future();
-
-  auto request = std::make_shared<RequestInfo>();
-  request->write_promise = write_promise;
-
-  if (!request_map_.Insert(req_id, request)) {
-    update_failed_.fetch_add(1, std::memory_order_relaxed);
-    std::cerr << "[Insert] Error to insert request: " << req_id << std::endl;
-    return DB::kErrorConflict;
-  }
-
-  RequestCleaner cleaner(request_map_, req_id);
 
   rte_mbuf *mbuf = BuildRequestPacket(key, WRITE_REQUEST, req_id, values);
   if (!mbuf) {
@@ -618,48 +550,19 @@ int CacheMigrationDpdk::Insert(const std::string & /*table*/,
 
   std::unique_ptr<rte_mbuf, decltype(&rte_pktmbuf_free)> mbuf_guard(
       mbuf, rte_pktmbuf_free);
+  pkts.push_back(mbuf);
+  mbuf_guard.release();
 
-  try {
-    for (int attempt = 0; attempt < RETRIES; ++attempt) {
-      uint64_t start_us = get_now_micros();
+  auto request = std::make_shared<RequestInfo>();
+  request->start_us = get_now_micros();
+  request->mbuf = mbuf;
 
-      if (rte_ring_enqueue(assigned_ring, mbuf) < 0) {
-        throw std::runtime_error("Failed to enqueue packet");
-      }
-      mbuf_guard.release();
-
-      if (future.wait_for(std::chrono::milliseconds(100)) ==
-          std::future_status::ready) {
-        if (future.get()) {
-          uint64_t latency_us = 0;
-          bool found = request_map_.Visit(req_id, [&](const auto &req) {
-            latency_us = req->completed_us - start_us;
-          });
-          if (!found) {
-            std::cerr << "Request not found when computing latency\n";
-            return DB::kErrorNoData;
-          }
-          thread_stats.total_latency_us += latency_us;
-          thread_stats.completed_requests++;
-
-          update_success_.fetch_add(1, std::memory_order_relaxed);
-          return DB::kOK;
-        } else {
-          return DB::kErrorRejected;
-        }
-      }
-      mbuf = BuildRequestPacket(key, WRITE_REQUEST, req_id, values);
-      if (!mbuf) throw std::runtime_error("Rebuild packet failed");
-      mbuf_guard.reset(mbuf);
-      exponentialBackoff(attempt);
-    }
-    throw std::runtime_error("Max retries exceeded");
-  } catch (const std::exception &e) {
-    std::cerr << "[Insert] Error: " << e.what() << ", req_id: " << req_id
-              << std::endl;
+  if (!request_map_.Insert(req_id, request)) {
     update_failed_.fetch_add(1, std::memory_order_relaxed);
-    return DB::kErrorNoData;
+    std::cerr << "[Insert] Error to insert request: " << req_id << std::endl;
+    return DB::kErrorConflict;
   }
+  return DB::kOK;
 }
 
 int CacheMigrationDpdk::Update(const std::string &table, const std::string &key,

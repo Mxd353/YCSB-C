@@ -27,7 +27,7 @@ class DB {
   /// Called once per DB client (thread); there is a single DB instance
   /// globally.
   ///
-  virtual void Init() {}
+  virtual void Init(const int thread_id, const int num_ops) = 0;
   ///
   /// Clears any state for accessing this DB.
   /// Called once per DB client (thread); there is a single DB instance

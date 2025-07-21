@@ -13,12 +13,14 @@
 #include <future>
 #include <iostream>
 #include <string>
+#include <typeinfo>
 #include <vector>
 
 #include "core/client.h"
 #include "core/core_workload.h"
 #include "core/timer.h"
 #include "core/utils.h"
+#include "db/cache_migration_dpdk.h"
 #include "db/db_factory.h"
 
 using namespace std;
@@ -33,8 +35,8 @@ void Init(utils::Properties &props);
 void PrintInfo(utils::Properties &props);
 
 int DelegateClient(ycsbc::DB *db, ycsbc::CoreWorkload *wl, const int num_ops,
-                   const int /*thread_id*/, bool is_loading) {
-  db->Init();
+                   const int thread_id, bool is_loading) {
+  db->Init(thread_id, num_ops);
   struct DBCleaner {
     ycsbc::DB *db;
     ~DBCleaner() { db->Close(); }
@@ -68,7 +70,6 @@ int main(const int argc, const char *argv[]) {
   vector<future<int>> actual_ops;
   int total_ops = 0;
   int sum = 0;
-  utils::Timer<std::chrono::microseconds> timer;
 
   PrintInfo(props);
   ycsbc::CoreWorkload wl;
@@ -83,7 +84,6 @@ int main(const int argc, const char *argv[]) {
     int remaining_ops = total_ops % threads_to_launch;
 
     fprintf(stderr, "Do load use %d threads...\n", threads_to_launch);
-    timer.Start();
 
     for (int i = 0; i < threads_to_launch; ++i) {
       int ops_to_process = ops_per_thread + (i < remaining_ops ? 1 : 0);
@@ -101,15 +101,19 @@ int main(const int argc, const char *argv[]) {
         std::cerr << "Error in thread: " << e.what() << std::endl;
       }
     }
-    auto use_time = timer.End();
     fflush(stderr);
 
-    printf("********** load result **********\n");
-    printf(
-        "Total ops  : %5d  use time: %6.3f s  IOPS: %6.2f iops (%6.2f us/op)\n",
-        sum, use_time / 1e6, sum * 1e6 / use_time, (double)use_time / sum);
+    if (auto *cmd = dynamic_cast<ycsbc::CacheMigrationDpdk *>(db)) {
+      cmd->StartDpdk();
+    }
+    
+    // printf("********** load result **********\n");
+    // printf(
+    //     "Total ops  : %5d  use time: %6.3f s  IOPS: %6.2f iops (%6.2f
+    //     us/op)\n", sum, use_time / 1e6, sum * 1e6 / use_time,
+    //     (double)use_time / sum);
 
-    printf("*********************************\n");
+    // printf("*********************************\n");
 
     if (print_stats) {
       printf("-------------- db statistics --------------\n");

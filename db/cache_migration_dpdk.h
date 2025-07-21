@@ -25,7 +25,7 @@ extern std::atomic<bool> running;
 struct TxConf {
   uint lcore_id;
   uint16_t queue_id = 0;
-  std::vector<rte_ring *> rings{};
+  int packets_index = 0;
 };
 
 namespace ycsbc {
@@ -39,8 +39,9 @@ class CacheMigrationDpdk : public DB {
 
   CacheMigrationDpdk(int num_threads);
   ~CacheMigrationDpdk();
-  void Init() override;
+  void Init(const int thread_id, const int num_ops) override;
   void Close() override;
+  void StartDpdk();
   int Read(const std::string &table, const std::string &key,
            const std::vector<std::string> *fields,
            std::vector<KVPair> &result) override;
@@ -57,6 +58,7 @@ class CacheMigrationDpdk : public DB {
 
  private:
   const int num_threads_;
+  static thread_local int thread_id_;
   ConsistentHash consistent_hash_;
   std::vector<std::pair<uint, uint16_t>> rx_cores_;
   std::vector<TxConf> tx_cores_;
@@ -72,6 +74,12 @@ class CacheMigrationDpdk : public DB {
   static thread_local rte_be32_t src_ip_;
   static thread_local uint dev_id_;
 
+  uint64_t send_start_us_ = 0;
+  std::thread timeout_thread_;
+
+  std::atomic<size_t> total_request_count_{0};
+  std::atomic<size_t> completed_count_{0};
+  std::atomic<size_t> timeout_count_{0};
   std::atomic<size_t> read_count_{0};
   std::atomic<size_t> read_success_{0};
   std::atomic<size_t> update_count_{0};
@@ -96,12 +104,10 @@ class CacheMigrationDpdk : public DB {
   std::vector<std::unique_ptr<TxConf>> tx_args_;
 
   struct RequestInfo {
-    std::shared_ptr<std::promise<std::vector<KVPair>>> read_promise =
-        std::make_shared<std::promise<std::vector<KVPair>>>();
-    std::shared_ptr<std::promise<bool>> write_promise =
-        std::make_shared<std::promise<bool>>();
-
+    rte_mbuf *mbuf;
+    uint64_t start_us;
     uint64_t completed_us;
+    int retry_count;
 
     bool completed = false;
   };
@@ -116,6 +122,8 @@ class CacheMigrationDpdk : public DB {
                                       const std::vector<KVPair> &values);
 
   void ProcessReceivedPacket(struct rte_mbuf *mbuf);
+
+  void TimeoutMonitorThread();
 
   static inline int RxMain(void *arg) {
     RxArgs *args = static_cast<RxArgs *>(arg);
