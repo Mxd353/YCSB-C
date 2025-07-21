@@ -664,24 +664,52 @@ int CacheMigrationDpdk::Delete(const std::string &table,
 }
 
 void CacheMigrationDpdk::PrintStats() {
-  uint64_t total_ops = 0;
-  uint64_t total_latency_us = 0;
-  for (const auto &s : all_thread_stats_) {
-    total_ops += s.completed_requests;
-    total_latency_us += s.total_latency_us;
+  std::vector<double> iopss(all_thread_stats_.size(), 0.0);
+  std::vector<double> latency_uss(all_thread_stats_.size(), 0.0);
+  double total_iops = 0.0;
+  uint64_t total_completed = 0;
+  uint64_t max_thread_latency_us = 0;
+  uint64_t total_latency_us_all_threads = 0;
+
+  for (size_t i = 0; i < all_thread_stats_.size(); ++i) {
+    const auto &s = all_thread_stats_[i];
+    double iops = s.total_latency_us > 0
+                      ? s.completed_requests / s.total_latency_us / 1'000'000.0
+                      : 0.0;
+    double latency_us =
+        s.completed_requests > 0
+            ? static_cast<double>(s.total_latency_us) / s.completed_requests
+            : 0.0;
+
+    iopss[i] = iops;
+    latency_uss[i] = latency_us;
+    total_iops += iops;
+
+    total_completed += s.completed_requests;
+    total_latency_us_all_threads += s.total_latency_us;
+
+    if (s.total_latency_us > max_thread_latency_us) {
+      max_thread_latency_us = s.total_latency_us;
+    }
   }
 
-  const double avg_latency_us =
-      total_ops > 0 ? static_cast<double>(total_latency_us) / total_ops : 0.0;
-  const double total_time_sec =
-      total_latency_us > 0 ? total_latency_us / 1'000'000.0 : 0.0;
+  double conservative_total_iops =
+      max_thread_latency_us > 0
+          ? total_completed / (max_thread_latency_us / 1'000'000.0)
+          : 0.0;
 
-  const double iops = total_time_sec > 0 ? total_ops / total_time_sec : 0.0;
+  double average_latency_us =
+      total_completed > 0
+          ? static_cast<double>(total_latency_us_all_threads) / total_completed
+          : 0.0;
 
   std::cout << "[Stats] CacheMigrationDpdk Statistics:\n"
-            << "Total Ops: " << total_ops
-            << ", Avg Latency (us): " << avg_latency_us << " us, IOPS: " << iops
-            << "\n"
+            << "Per-thread IOPS sum: " << total_iops << " ops/sec\n"
+            << "Total completed requests: " << total_completed << "\n"
+            << "Max thread run time: " << max_thread_latency_us / 1e6 << " s\n"
+            << "System IOPS (total_requests / max_thread_time): "
+            << conservative_total_iops << " ops/sec\n"
+            << "Average latency per request: " << average_latency_us << " us\n"
             << "  Total Reads: " << read_count_.load() << "\n"
             << "  Successful Reads: " << read_success_.load() << "\n"
             << "  No Result Reads: " << no_result_.load() << "\n"
