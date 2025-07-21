@@ -31,6 +31,16 @@ class RequestMap {
     return false;
   }
 
+  template <typename Fn>
+  bool Visit(U req_id, Fn&& fn) const {
+    auto it = map_.find(req_id);
+    if (it != map_.end()) {
+      fn(it->second);
+      return true;
+    }
+    return false;
+  }
+
   bool Erase(U req_id) noexcept {
     std::unique_lock<std::shared_mutex> lock(map_mutex_);
     return map_.unsafe_erase(req_id) > 0;

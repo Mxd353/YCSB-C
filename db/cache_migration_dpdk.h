@@ -101,6 +101,8 @@ class CacheMigrationDpdk : public DB {
     std::shared_ptr<std::promise<bool>> write_promise =
         std::make_shared<std::promise<bool>>();
 
+    uint64_t completed_us;
+
     bool completed = false;
   };
 

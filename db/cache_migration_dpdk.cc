@@ -287,6 +287,7 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
 }
 
 void CacheMigrationDpdk::ProcessReceivedPacket(struct rte_mbuf *mbuf) {
+  uint64_t completed_us = get_now_micros();
   struct rte_ether_hdr *eth_hdr =
       rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
   if (eth_hdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) return;
@@ -314,6 +315,7 @@ void CacheMigrationDpdk::ProcessReceivedPacket(struct rte_mbuf *mbuf) {
       return;
     }
     req->completed = true;
+    req->completed_us = completed_us;
     std::string key_str(kv_header->key.begin(), kv_header->key.end());
     const uint8_t op = GET_OP(kv_header->combined);
     try {
@@ -560,8 +562,15 @@ int CacheMigrationDpdk::Read(const std::string & /*table*/,
 
       if (future.wait_for(std::chrono::milliseconds(100)) ==
           std::future_status::ready) {
-        auto elapsed = get_now_micros() - start_us;
-        thread_stats.total_latency_us += elapsed;
+        uint64_t latency_us = 0;
+        bool found = request_map_.Visit(req_id, [&](const auto &req) {
+          latency_us = req->completed_us - start_us;
+        });
+        if (!found) {
+          std::cerr << "Request not found when computing latency\n";
+          return DB::kErrorNoData;
+        }
+        thread_stats.total_latency_us += latency_us;
         thread_stats.completed_requests++;
 
         result = future.get();
@@ -622,8 +631,15 @@ int CacheMigrationDpdk::Insert(const std::string & /*table*/,
       if (future.wait_for(std::chrono::milliseconds(100)) ==
           std::future_status::ready) {
         if (future.get()) {
-          auto elapsed = get_now_micros() - start_us;
-          thread_stats.total_latency_us += elapsed;
+          uint64_t latency_us = 0;
+          bool found = request_map_.Visit(req_id, [&](const auto &req) {
+            latency_us = req->completed_us - start_us;
+          });
+          if (!found) {
+            std::cerr << "Request not found when computing latency\n";
+            return DB::kErrorNoData;
+          }
+          thread_stats.total_latency_us += latency_us;
           thread_stats.completed_requests++;
 
           update_success_.fetch_add(1, std::memory_order_relaxed);
@@ -674,7 +690,7 @@ void CacheMigrationDpdk::PrintStats() {
   for (size_t i = 0; i < all_thread_stats_.size(); ++i) {
     const auto &s = all_thread_stats_[i];
     double iops = s.total_latency_us > 0
-                      ? s.completed_requests / s.total_latency_us / 1'000'000.0
+                      ? s.completed_requests * 1'000'000.0 / s.total_latency_us
                       : 0.0;
     double latency_us =
         s.completed_requests > 0
@@ -683,6 +699,12 @@ void CacheMigrationDpdk::PrintStats() {
 
     iopss[i] = iops;
     latency_uss[i] = latency_us;
+
+    std::cout << " Thread[ " << i << " ]\n"
+              << "total_latency_us = " << s.total_latency_us << "\n"
+              << "completed_requests = " << s.completed_requests << "\n"
+              << "iops = " << iops << "\n";
+
     total_iops += iops;
 
     total_completed += s.completed_requests;
@@ -700,8 +722,10 @@ void CacheMigrationDpdk::PrintStats() {
 
   double average_latency_us =
       total_completed > 0
-          ? static_cast<double>(total_latency_us_all_threads) / total_completed
+          ? static_cast<double>(max_thread_latency_us) / total_completed
           : 0.0;
+
+  all_thread_stats_.clear();
 
   std::cout << "[Stats] CacheMigrationDpdk Statistics:\n"
             << "Per-thread IOPS sum: " << total_iops << " ops/sec\n"
