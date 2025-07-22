@@ -70,6 +70,7 @@ int main(const int argc, const char *argv[]) {
   vector<future<int>> actual_ops;
   int total_ops = 0;
   int sum = 0;
+  utils::Timer<std::chrono::microseconds> timer;
 
   PrintInfo(props);
   ycsbc::CoreWorkload wl;
@@ -103,10 +104,16 @@ int main(const int argc, const char *argv[]) {
     }
     fflush(stderr);
 
-    if (auto *cmd = dynamic_cast<ycsbc::CacheMigrationDpdk *>(db)) {
-      cmd->StartDpdk();
+    if (db && db->GetName() == "cache_migration_dpdk") {
+      auto *cmd = dynamic_cast<ycsbc::CacheMigrationDpdk *>(db);
+      if (cmd) {
+        cmd->StartDpdk();
+      } else {
+        std::cerr << "Error: DB name is 'cache_migration_dpdk' but "
+                     "dynamic_cast failed.\n";
+      }
     }
-    
+
     // printf("********** load result **********\n");
     // printf(
     //     "Total ops  : %5d  use time: %6.3f s  IOPS: %6.2f iops (%6.2f

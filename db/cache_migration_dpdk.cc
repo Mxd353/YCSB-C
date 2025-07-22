@@ -88,15 +88,15 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
     return;
   }
 
-  tx_mbufpool_ = rte_pktmbuf_pool_create(
-      "TX_MBUF_POOL", NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE,
-      RTE_MBUF_PRIV_ALIGN, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+  tx_mbufpool_ = rte_pktmbuf_pool_create("TX_MBUF_POOL", NUM_MBUFS,
+                                         MBUF_CACHE_SIZE, RTE_MBUF_PRIV_ALIGN,
+                                         MBUF_DATA_SIZE, rte_socket_id());
   if (tx_mbufpool_ == NULL)
     rte_exit(EXIT_FAILURE, "Cannot create TX_MBUF_POOL\n");
 
-  rx_mbufpool_ = rte_pktmbuf_pool_create(
-      "RX_MBUF_POOL", NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE,
-      RTE_MBUF_PRIV_ALIGN, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+  rx_mbufpool_ = rte_pktmbuf_pool_create("RX_MBUF_POOL", NUM_MBUFS,
+                                         MBUF_CACHE_SIZE, RTE_MBUF_PRIV_ALIGN,
+                                         MBUF_DATA_SIZE, rte_socket_id());
   if (rx_mbufpool_ == NULL)
     rte_exit(EXIT_FAILURE, "Cannot create RX_MBUF_POOL\n");
 
@@ -104,13 +104,6 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
 
   rte_ether_unformat_addr("00:11:22:33:44:55", &s_eth_addr_);
   rte_ether_unformat_addr("aa:bb:cc:dd:ee:ff", &d_eth_addr_);
-
-  uint16_t port = 0;
-  if (PortInit(port) != 0) {
-    std::cerr << "Failed to initialize port " << (unsigned)port
-              << ", Error: " << rte_strerror(rte_errno) << std::endl;
-    rte_exit(EXIT_FAILURE, "Cannot init port %" PRIu16 "\n", port);
-  }
 
   std::cout << "+++++++++++++++++++++++++++++++++\n";
 }
@@ -157,9 +150,20 @@ void CacheMigrationDpdk::Close() {}
 void CacheMigrationDpdk::StartDpdk() {
   std::cout << "start DPDK.." << std::endl;
   running = true;
-  timeout_thread_ =
-      std::thread(&CacheMigrationDpdk::TimeoutMonitorThread, this);
+  uint16_t port = 0;
+
+  if (PortInit(port) != 0) {
+    std::cerr << "Failed to initialize port " << (unsigned)port
+              << ", Error: " << rte_strerror(rte_errno) << std::endl;
+    rte_exit(EXIT_FAILURE, "Cannot init port %" PRIu16 "\n", port);
+  }
+
+  if (timeout_core_ == UINT_MAX)
+    timeout_thread_ =
+        std::thread(&CacheMigrationDpdk::TimeoutMonitorThread, this);
+
   LaunchThreads();
+
   while (completed_count_ + timeout_count_ < total_request_count_) {
     std::this_thread::sleep_for(std::chrono::milliseconds(10));
   }
@@ -167,16 +171,43 @@ void CacheMigrationDpdk::StartDpdk() {
 
 inline void CacheMigrationDpdk::AssignCores() {
   uint lcore_id;
-  uint count = 0;
-  uint core_count = rte_lcore_count();
-  RTE_LCORE_FOREACH_WORKER(lcore_id) {
-    if (count++ < (core_count - 1) / 2) {
-      rx_cores_.push_back(std::make_pair(lcore_id, 0));
-    } else {
-      tx_cores_.push_back(TxConf{lcore_id});
-    }
+  std::vector<uint> workers;
+
+  RTE_LCORE_FOREACH_WORKER(lcore_id) { workers.push_back(lcore_id); }
+
+  size_t total_workers = workers.size();
+  if (total_workers < 3) {
+    rte_exit(EXIT_FAILURE,
+             "Need at least 3 worker cores (got %zu): RX, TX, and "
+             "TimeoutMonitorThread\n",
+             total_workers);
   }
+
+  rx_cores_.clear();
+  tx_cores_.clear();
+
+  bool odd = (total_workers % 2 == 1);
+  timeout_core_ = odd ? workers.back() : UINT_MAX;
+
+  size_t usable_cores = odd ? total_workers - 1 : total_workers;
+  size_t rx_count = (usable_cores * 2) / 3;
+
+  for (size_t i = 0; i < rx_count; ++i) {
+    rx_cores_.push_back(std::make_pair(workers[i], 0));
+  }
+
+  for (size_t i = rx_count; i < usable_cores; ++i) {
+    tx_cores_.push_back(TxConf{workers[i]});
+  }
+
   num_tx_cores_ = tx_cores_.size();
+  printf("Assigned %zu RX cores, %zu TX cores\n", rx_cores_.size(),
+         tx_cores_.size());
+  if (timeout_core_ == UINT_MAX) {
+    printf("No dedicated timeout core assigned (timeout_core_ = UINT_MAX)\n");
+  } else {
+    printf("Timeout core assigned: %u\n", timeout_core_);
+  }
 }
 
 int CacheMigrationDpdk::PortInit(uint16_t port) {
@@ -186,10 +217,8 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
   uint16_t nb_rx_cores = rx_cores_.size();
   uint16_t nb_tx_cores = tx_cores_.size();
 
-  if (tx_mbufpool_ == NULL || rx_mbufpool_ == NULL) {
-    printf("mbuf_pool is NULL!\n");
-    return -1;
-  }
+  if (tx_mbufpool_ == NULL || rx_mbufpool_ == NULL)
+    rte_exit(EXIT_FAILURE, "mbuf_pool is NULL!\n");
 
   struct rte_eth_conf port_conf;
   if (!rte_eth_dev_is_valid_port(port)) return -1;
@@ -202,6 +231,8 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
     std::cerr << "Error getting device info: " << rte_strerror(retval) << "\n";
     return retval;
   }
+
+  uint16_t max_supported_tx_queues = dev_info.max_tx_queues;
 
   if (dev_info.flow_type_rss_offloads & RTE_ETH_RSS_IP) {
     port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
@@ -217,35 +248,52 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
     port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 
   retval = rte_eth_dev_configure(port, nb_rx_cores, nb_tx_cores, &port_conf);
-  if (retval != 0) return retval;
+  if (retval != 0) rte_exit(EXIT_FAILURE, "Cannot configure port\n");
 
   retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, &nb_txd);
-  if (retval != 0) return retval;
+  if (retval != 0) rte_exit(EXIT_FAILURE, "Cannot adjust desc number\n");
+  printf("Adjusted nb_rxd = %u, nb_txd = %u\n", nb_rxd, nb_txd);
 
   for (uint16_t q = 0; q < nb_rx_cores; ++q) {
     retval = rte_eth_rx_queue_setup(
         port, q, nb_rxd, rte_eth_dev_socket_id(port), nullptr, rx_mbufpool_);
-    if (retval < 0) return retval;
+    if (retval < 0) rte_exit(EXIT_FAILURE, "Cannot setup RX queue\n");
     rx_cores_[q].second = q;
   }
 
   struct rte_eth_txconf txconf;
   memset(&txconf, 0, sizeof(txconf));
-  for (uint16_t q = 0; q < nb_tx_cores; ++q) {
+  uint16_t q = 0;
+  for (q = 0; q < nb_tx_cores; ++q) {
     retval = rte_eth_tx_queue_setup(port, q, nb_txd,
                                     rte_eth_dev_socket_id(port), &txconf);
-    if (retval < 0) return retval;
+    if (retval < 0) rte_exit(EXIT_FAILURE, "Cannot setup TX queue\n");
 
     tx_cores_[q].queue_id = q;
   }
+
+  if ((nb_tx_cores + (timeout_core_ != UINT_MAX ? 1 : 0)) >
+      max_supported_tx_queues) {
+    rte_exit(EXIT_FAILURE, "Too many TX queues requested\n");
+  }
+
+  if (timeout_core_ != UINT_MAX) {
+    uint16_t timeout_q = q++;
+    retval = rte_eth_tx_queue_setup(port, timeout_q, nb_txd,
+                                    rte_eth_dev_socket_id(port), &txconf);
+    if (retval < 0) rte_exit(EXIT_FAILURE, "Cannot setup timeout TX queue\n");
+    timeout_queue_ = timeout_q;
+  }
+
+  retval = rte_eth_promiscuous_enable(port);
+  if (retval != 0) rte_exit(EXIT_FAILURE, "Cannot set promiscuous\n");
+
   retval = rte_eth_dev_start(port);
-  if (retval < 0) return retval;
+  if (retval < 0) rte_exit(EXIT_FAILURE, "Cannot start port\n");
 
   printf("Port %u MAC: " RTE_ETHER_ADDR_PRT_FMT "\n", (unsigned)port,
          RTE_ETHER_ADDR_BYTES(&s_eth_addr_));
 
-  retval = rte_eth_promiscuous_enable(port);
-  if (retval != 0) return retval;
   return 0;
 }
 
@@ -399,9 +447,9 @@ inline int CacheMigrationDpdk::TxMain(void *arg) {
 
   send_start_us = get_now_micros();
 
-  for (size_t i = 0; i < pkts.size(); i += BURST_SIZE) {
+  for (size_t i = 0; i < total_pkts; i += BURST_SIZE) {
     size_t this_burst =
-        std::min(static_cast<unsigned long>(BURST_SIZE), pkts.size() - i);
+        std::min(static_cast<unsigned long>(BURST_SIZE), total_pkts - i);
 
     std::memcpy(burst, &pkts[i], this_burst * sizeof(rte_mbuf *));
 

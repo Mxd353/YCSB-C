@@ -13,8 +13,9 @@
 #include "lib/consistent_hash.h"
 #include "lib/request_map.h"
 
-#define NUM_MBUFS 16384
-#define MBUF_CACHE_SIZE 512
+#define NUM_MBUFS (100 * 1000 * 1000)
+#define MBUF_CACHE_SIZE 250
+#define MBUF_DATA_SIZE 256
 #define RX_RING_SIZE 1024
 #define TX_RING_SIZE 4096
 #define TX_RING_COUNT 32
@@ -76,6 +77,8 @@ class CacheMigrationDpdk : public DB {
 
   uint64_t send_start_us_ = 0;
   std::thread timeout_thread_;
+  uint timeout_core_ = UINT_MAX;
+  uint16_t timeout_queue_ = 0;
 
   std::atomic<size_t> total_request_count_{0};
   std::atomic<size_t> completed_count_{0};

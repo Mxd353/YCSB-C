@@ -19,15 +19,20 @@ using ycsbc::DB;
 using ycsbc::DBFactory;
 
 DB* DBFactory::CreateDB(utils::Properties& props) {
-  if (props["dbname"] == "basic") {
-    return new BasicDB;
-  } else if (props["dbname"] == "cache_migration_dpdk") {
-    const int num_threads = stoi(props.GetProperty("threadcount", "1"));
-    auto* db = new CacheMigrationDpdk(num_threads);
-    return db;
-  } else if (props["dbname"] == "hot_statistics") {
-    auto* db = new HotStatistics();
-    return db;
+  const std::string dbname = props["dbname"];
+  DB* db = nullptr;
+
+  if (dbname == "basic") {
+    db = new BasicDB();
+  } else if (dbname == "cache_migration_dpdk") {
+    const int num_threads = std::stoi(props.GetProperty("threadcount", "1"));
+    db = new CacheMigrationDpdk(num_threads);
+  } else if (dbname == "hot_statistics") {
+    db = new HotStatistics();
   }
-  return NULL;
+
+  if (db != nullptr) {
+    db->SetName(dbname);
+  }
+  return db;
 }
