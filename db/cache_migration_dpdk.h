@@ -40,7 +40,8 @@ class CacheMigrationDpdk : public DB {
 
   CacheMigrationDpdk(int num_threads);
   ~CacheMigrationDpdk();
-  void Init(const int thread_id, const int num_ops) override;
+  void AllocateSpace(size_t total_ops) override;
+  void Init(const int thread_id) override;
   void Close() override;
   void StartDpdk();
   int Read(const std::string &table, const std::string &key,

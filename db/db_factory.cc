@@ -25,8 +25,7 @@ DB* DBFactory::CreateDB(utils::Properties& props) {
   if (dbname == "basic") {
     db = new BasicDB();
   } else if (dbname == "cache_migration_dpdk") {
-    const int num_threads = std::stoi(props.GetProperty("threadcount", "1"));
-    db = new CacheMigrationDpdk(num_threads);
+    db = new CacheMigrationDpdk(props);
   } else if (dbname == "hot_statistics") {
     db = new HotStatistics();
   }
