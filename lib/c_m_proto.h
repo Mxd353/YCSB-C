@@ -26,8 +26,10 @@
 #define IP_PROTOCOLS_PRE_WRITE 0x60
 #define IP_PROTOCOLS_ASK 0x61
 
-#define KEY_LENGTH 16
-#define VALUE_LENGTH 4
+namespace c_m_proto {
+
+constexpr size_t KEY_LENGTH = 16;
+constexpr size_t VALUE_LENGTH = 4;
 
 constexpr uint16_t RETRIES = 3;
 
@@ -165,3 +167,4 @@ template <>
 struct PacketTraits<AskPacket> {
   static constexpr uint8_t Protocol = IP_PROTOCOLS_ASK;
 };
+}  // namespace c_m_proto
