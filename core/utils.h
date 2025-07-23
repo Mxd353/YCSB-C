@@ -86,9 +86,29 @@ inline void ReverseRTE_IPV4(uint32_t ip, std::string &result) {
            std::to_string(b) + "." + std::to_string(a);
 }
 
-static inline uint32_t generate_request_id() {
+class RequestIDGenerator {
+ private:
+  static std::atomic<uint32_t> counter;
+
+ public:
+  static uint32_t next() {
+    return counter.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  static void reset() { counter.store(0, std::memory_order_relaxed); }
+};
+
+static inline uint32_t global_request_id() {
   static std::atomic<uint32_t> counter{0};
   return counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+static inline uint32_t generate_request_id(uint32_t thread_id) {
+  constexpr uint32_t MAX_REQ_PER_THREAD = 10'000'000;
+
+  thread_local static uint32_t local_counter = 0;
+
+  return thread_id * MAX_REQ_PER_THREAD + local_counter++;
 }
 
 }  // namespace utils
