@@ -80,8 +80,8 @@ ConsistentHash::ConsistentHash(const std::string &server_ip_file,
             << "\n========================================\n";
 }
 
-void ConsistentHash::MigrateKey(const std::array<char, KEY_LENGTH> &key,
-                                rte_be32_t newServer) {
+void ConsistentHash::MigrateKey(
+    const std::array<char, c_m_proto::KEY_LENGTH> &key, rte_be32_t newServer) {
   std::string key_str(key.begin(), key.end());
   std::string oldip_str;
   utils::ReverseRTE_IPV4(uint32_t(FindServer(key_str)), oldip_str);

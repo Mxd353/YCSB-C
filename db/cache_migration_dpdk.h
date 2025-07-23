@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "core/db.h"
+#include "core/properties.h"
 #include "lib/c_m_proto.h"
 #include "lib/consistent_hash.h"
 #include "lib/request_map.h"
@@ -23,10 +24,59 @@
 
 extern std::atomic<bool> running;
 
+struct RequestInfo {
+  rte_mbuf *mbuf = nullptr;
+  uint64_t start_time = 0;
+  uint64_t completed_time = 0;
+  int retry_count = 0;
+  uint8_t op = 0;
+
+  std::atomic<bool> completed;
+
+  RequestInfo() : completed(false) {}
+
+  RequestInfo(RequestInfo &&other) noexcept
+      : mbuf(other.mbuf),
+        start_time(other.start_time),
+        completed_time(other.completed_time),
+        retry_count(other.retry_count),
+        op(other.op),
+        completed(other.completed.load(std::memory_order_relaxed)) {
+    other.mbuf = nullptr;
+    other.start_time = 0;
+    other.completed_time = 0;
+    other.retry_count = 0;
+    other.op = 0;
+    other.completed.store(false, std::memory_order_relaxed);
+  }
+
+  RequestInfo &operator=(RequestInfo &&other) noexcept {
+    if (this != &other) {
+      mbuf = other.mbuf;
+      start_time = other.start_time;
+      completed_time = other.completed_time;
+      retry_count = other.retry_count;
+      op = other.op;
+      completed.store(other.completed.load(std::memory_order_relaxed));
+
+      other.mbuf = nullptr;
+      other.start_time = 0;
+      other.completed_time = 0;
+      other.retry_count = 0;
+      other.op = 0;
+      other.completed.store(false, std::memory_order_relaxed);
+    }
+    return *this;
+  }
+
+  RequestInfo(const RequestInfo &) = delete;
+  RequestInfo &operator=(const RequestInfo &) = delete;
+};
+
 struct TxConf {
   uint lcore_id;
   uint16_t queue_id = 0;
-  int packets_index = 0;
+  std::pair<size_t, size_t> interval{0, 0};
 };
 
 namespace ycsbc {
@@ -38,7 +88,7 @@ class CacheMigrationDpdk : public DB {
     uint64_t iops = 0;
   };
 
-  CacheMigrationDpdk(int num_threads);
+  CacheMigrationDpdk(utils::Properties &props);
   ~CacheMigrationDpdk();
   void AllocateSpace(size_t total_ops) override;
   void Init(const int thread_id) override;
@@ -64,7 +114,7 @@ class CacheMigrationDpdk : public DB {
   ConsistentHash consistent_hash_;
   std::vector<std::pair<uint, uint16_t>> rx_cores_;
   std::vector<TxConf> tx_cores_;
-  int num_tx_cores_ = 0;
+  size_t num_tx_cores_ = 0;
   struct rte_mempool *tx_mbufpool_;
   struct rte_mempool *rx_mbufpool_;
   uint8_t port_id_ = 0;
@@ -76,14 +126,10 @@ class CacheMigrationDpdk : public DB {
   static thread_local rte_be32_t src_ip_;
   static thread_local uint dev_id_;
 
-  uint64_t send_start_us_ = 0;
   std::thread timeout_thread_;
   uint timeout_core_ = UINT_MAX;
   uint16_t timeout_queue_ = 0;
 
-  std::atomic<size_t> total_request_count_{0};
-  std::atomic<size_t> completed_count_{0};
-  std::atomic<size_t> timeout_count_{0};
   std::atomic<size_t> read_count_{0};
   std::atomic<size_t> read_success_{0};
   std::atomic<size_t> update_count_{0};
@@ -96,9 +142,6 @@ class CacheMigrationDpdk : public DB {
                                         {"field2", "read"},
                                         {"field3", "read"}};
 
-  std::mutex stats_mutex;
-  std::vector<ThreadStats> all_thread_stats_;
-
   struct RxArgs {
     uint16_t queue_id;
     CacheMigrationDpdk *instance;
@@ -106,17 +149,6 @@ class CacheMigrationDpdk : public DB {
 
   std::vector<std::unique_ptr<RxArgs>> rx_args_;
   std::vector<std::unique_ptr<TxConf>> tx_args_;
-
-  struct RequestInfo {
-    rte_mbuf *mbuf;
-    uint64_t start_us;
-    uint64_t completed_us;
-    int retry_count;
-
-    bool completed = false;
-  };
-
-  RequestMap<uint32_t, RequestInfo> request_map_;
 
   inline void AssignCores();
   int PortInit(uint16_t port);
@@ -126,18 +158,12 @@ class CacheMigrationDpdk : public DB {
                                       const std::vector<KVPair> &values);
 
   void ProcessReceivedPacket(struct rte_mbuf *mbuf);
-
-  void TimeoutMonitorThread();
-
-  static inline int RxMain(void *arg) {
-    RxArgs *args = static_cast<RxArgs *>(arg);
-    args->instance->DoRx(args->queue_id);
-    return 0;
-  }
-
+  void RunTimeoutMonitor();
   void DoRx(uint16_t queue_id);
 
+  static inline int RxMain(void *arg);
   static inline int TxMain(void *arg);
+  static inline int TimeoutMonitorThread(void *arg);
 };
 }  // namespace ycsbc
 

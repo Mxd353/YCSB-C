@@ -24,7 +24,7 @@ class ConsistentHash {
  public:
   ConsistentHash(const std::string &server_ip_file, int virtual_node_count = 3);
   virtual ~ConsistentHash() = default;
-  void MigrateKey(const std::array<char, KEY_LENGTH> &key,
+  void MigrateKey(const std::array<char, c_m_proto::KEY_LENGTH> &key,
                   rte_be32_t newServer);
   void RemoveMigration(const std::string &key);
   rte_be32_t GetServerIp(const std::string &key);
