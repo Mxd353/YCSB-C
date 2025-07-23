@@ -14,10 +14,10 @@
 #include "lib/consistent_hash.h"
 #include "lib/request_map.h"
 
-#define NUM_MBUFS (100 * 1000 * 1000)
-#define MBUF_CACHE_SIZE 250
+#define NUM_MBUFS 600000
+#define MBUF_CACHE_SIZE 512
 #define MBUF_DATA_SIZE 256
-#define RX_RING_SIZE 1024
+#define RX_RING_SIZE 4096
 #define TX_RING_SIZE 4096
 #define TX_RING_COUNT 32
 #define BURST_SIZE 32

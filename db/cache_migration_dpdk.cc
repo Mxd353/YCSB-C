@@ -240,13 +240,8 @@ inline void CacheMigrationDpdk::AssignCores() {
   rx_cores_.clear();
   tx_cores_.clear();
 
-  // bool odd = (total_workers % 2 == 1);
-  // timeout_core_ = odd ? workers.back() : UINT_MAX;
-
-  // size_t usable_cores = odd ? total_workers - 1 : total_workers;
-  // size_t rx_count = (usable_cores * 2) / 3;
-  size_t rx_count = 2;
-  size_t tx_count = 1;
+  size_t rx_count = 4;
+  size_t tx_count = 2;
 
   for (size_t i = 0; i < rx_count; ++i) {
     rx_cores_.push_back(std::make_pair(workers[i], 0));
@@ -261,7 +256,6 @@ inline void CacheMigrationDpdk::AssignCores() {
          tx_cores_.size());
 
   timeout_core_ = rx_count + tx_count + 1;
-
   if (timeout_core_ == UINT_MAX) {
     printf("No dedicated timeout core assigned (timeout_core_ = UINT_MAX)\n");
   } else {
@@ -400,60 +394,69 @@ void CacheMigrationDpdk::ProcessReceivedPacket(struct rte_mbuf *mbuf) {
 }
 
 void CacheMigrationDpdk::RunTimeoutMonitor() {
-  constexpr uint64_t kSleepIntervalUs = 1000;
+  constexpr uint64_t kSleepIntervalUs = 10;
   const uint16_t kMaxRetries = c_m_proto::RETRIES;
+  constexpr size_t kBatchSize = 1000;
 
   while (running.load(std::memory_order_acquire)) {
     try {
       uint64_t now = get_now_micros();
 
-      for (size_t i = 0; i < requests.size(); ++i) {
-        RequestInfo &req = requests[i];
+      for (size_t i = 0; i < requests.size(); i += kBatchSize) {
+        size_t end = std::min(i + kBatchSize, requests.size());
+        for (size_t j = i; j < end; ++j) {
+          RequestInfo &req = requests[j];
 
-        if (req.start_time == 0 ||
-            req.completed.load(std::memory_order_acquire) || !req.mbuf) {
-          continue;
+          if (req.start_time == 0 ||
+              req.completed.load(std::memory_order_acquire) || !req.mbuf)
+            continue;
+
+          uint64_t elapsed_time =
+              (now >= req.start_time) ? (now - req.start_time) : 0;
+
+          uint64_t expected_timeout = time_out_us(req.retry_count);
+
+          if (elapsed_time < expected_timeout) continue;
+
+          if (req.retry_count >= kMaxRetries) {
+            if (req.completed.exchange(true, std::memory_order_acq_rel))
+              continue;
+
+            timeout_count.fetch_add(1, std::memory_order_relaxed);
+
+            auto &counter = (req.op == c_m_proto::READ_REQUEST)
+                                ? no_result_
+                                : update_failed_;
+            counter.fetch_add(1, std::memory_order_relaxed);
+
+            rte_mbuf *mbuf = std::exchange(req.mbuf, nullptr);
+            if (mbuf) rte_pktmbuf_free(mbuf);
+
+            continue;
+          }
+
+          if (req.mbuf) {
+            try {
+              // std::cerr << "[TimeOut] start: " << req.start_time;
+              int sent = rte_eth_tx_burst(0, timeout_queue_, &req.mbuf, 1);
+              if (sent == 1) {
+                req.retry_count++;
+                req.start_time = now;
+              }
+              // std::cerr << " now: " << now << " time out: " << elapsed_time
+              // << std::endl;
+            } catch (const std::exception &e) {
+              std::cerr << "TX burst exception: " << e.what() << std::endl;
+              req.mbuf = nullptr;
+            }
+          }
+          rte_delay_us_sleep(kSleepIntervalUs);
         }
-
-        uint64_t elapsed_time =
-            (now >= req.start_time) ? (now - req.start_time) : 0;
-
-        uint64_t expected_timeout = time_out_us(req.retry_count);
-
-        if (elapsed_time < expected_timeout) continue;
-
-        if (req.retry_count >= kMaxRetries) {
-          if (req.completed.exchange(true, std::memory_order_acq_rel)) continue;
-
-          timeout_count.fetch_add(1, std::memory_order_relaxed);
-
-          auto &counter =
-              (req.op == c_m_proto::READ_REQUEST) ? no_result_ : update_failed_;
-          counter.fetch_add(1, std::memory_order_relaxed);
-
-          rte_mbuf *mbuf = std::exchange(req.mbuf, nullptr);
-          if (mbuf) rte_pktmbuf_free(mbuf);
-
-          continue;
-        }
-
-        // if (req.mbuf) {
-        //   try {
-        //     int sent = rte_eth_tx_burst(0, timeout_queue_, &req.mbuf, 1);
-        //     if (sent == 1) {
-        //       req.retry_count++;
-        //       req.start_time = now;
-        //     }
-        //   } catch (const std::exception &e) {
-        //     std::cerr << "TX burst exception: " << e.what() << std::endl;
-        //     req.mbuf = nullptr;
-        //   }
-        // }
       }
+      std::cout << get_now_micros() - now << std::endl;
     } catch (const std::exception &e) {
       std::cerr << "Timeout monitor error: " << e.what() << std::endl;
     }
-    rte_delay_us_sleep(kSleepIntervalUs);
   }
 }
 
@@ -519,44 +522,32 @@ inline int CacheMigrationDpdk::TxMain(void *arg) {
   size_t end = ctx->interval.second;
 
   send_start_us = get_now_micros();
-  for (size_t i = start; i < end; i += BURST_SIZE) {
-    size_t this_burst =
-        std::min(static_cast<unsigned long>(BURST_SIZE), end - i);
+  for (size_t i = start; i < end; ++i) {
+    struct rte_mbuf *mbuf = nullptr;
 
-    struct rte_mbuf *burst[BURST_SIZE];
-    auto batch_start = get_now_micros();
-    for (size_t j = 0; j < this_burst; ++j) {
-      if (requests[i + j].completed.load(std::memory_order_acquire)) {
-        burst[j] = nullptr;
-        std::cerr << "Request " << i + j << " already completed, skipping..."
-                  << std::endl;
-        continue;
-      }
+    if (requests[i].completed.load(std::memory_order_acquire)) continue;
 
-      if (requests[i + j].mbuf) {
-        burst[j] = requests[i + j].mbuf;
-        requests[i + j].start_time = batch_start;
-      } else {
-        burst[j] = nullptr;
-        std::cerr << "Request " << i + j << " has no mbuf, set to nullptr."
-                  << std::endl;
-      }
+    if (requests[i].mbuf) {
+      mbuf = requests[i].mbuf;
+      requests[i].start_time = get_now_micros();
+    } else {
+      std::cerr << "Request " << i << " has no mbuf, skipping..." << std::endl;
+      continue;
     }
 
-    uint16_t nb_tx = rte_eth_tx_burst(0, queue_id, burst, this_burst);
-    for (uint16_t k = nb_tx; k < this_burst; k++) {
-      requests[i + k].completed.store(true, std::memory_order_release);
-      if (burst[k] != nullptr) {
-        rte_pktmbuf_free(burst[k]);
-        burst[k] = nullptr;
-      }
-      requests[i + k].mbuf = nullptr;
+    uint16_t nb_tx = rte_eth_tx_burst(0, queue_id, &mbuf, 1);
+    if (nb_tx < 1) {
+      requests[i].completed.store(true, std::memory_order_release);
+      rte_pktmbuf_free(mbuf);
+      requests[i].mbuf = nullptr;
       false_count.fetch_add(1, std::memory_order_relaxed);
       std::cerr << " send error " << std::endl;
+    } else {
+      tx_success_count += nb_tx;
+      // rte_delay_us(1);
     }
 
-    tx_success_count += nb_tx;
-    tx_drop_count += this_burst - nb_tx;
+    tx_drop_count += (1 - nb_tx);
   }
   printf("TX thread [%u] sent %zu drop %zu requests (queue %u)\n",
          rte_lcore_id(), tx_success_count, tx_drop_count, queue_id);
@@ -790,7 +781,8 @@ void CacheMigrationDpdk::PrintStats() {
             << "  No Result Reads: " << no_result_.load() << "\n"
             << "  Total Updates: " << update_count_.load() << "\n"
             << "  Successful Updates: " << update_success_.load() << "\n"
-            << "  Failed Updates: " << update_failed_.load() << "\n";
+            << "  Failed Updates: " << update_failed_.load() << "\n"
+            << "  Time Out: " << timeout_count.load() << std::endl;
 }
 
 }  // namespace ycsbc
