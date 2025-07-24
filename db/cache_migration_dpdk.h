@@ -14,10 +14,12 @@
 #include "lib/consistent_hash.h"
 #include "lib/request_map.h"
 
-#define NUM_MBUFS 600000
+#define TX_NUM_MBUFS 1000000
+#define RX_NUM_MBUFS 262144
 #define MBUF_CACHE_SIZE 512
-#define MBUF_DATA_SIZE 256
-#define RX_RING_SIZE 4096
+#define TX_MBUF_DATA_SIZE 256
+#define RX_MBUF_DATA_SIZE 2048
+#define RX_RING_SIZE 8192
 #define TX_RING_SIZE 4096
 #define TX_RING_COUNT 32
 #define BURST_SIZE 32
@@ -159,6 +161,7 @@ class CacheMigrationDpdk : public DB {
 
   void ProcessReceivedPacket(struct rte_mbuf *mbuf);
   void RunTimeoutMonitor();
+  static inline int RunTimeoutMonitor(void *arg);
   void DoRx(uint16_t queue_id);
 
   static inline int RxMain(void *arg);
