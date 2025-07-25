@@ -36,6 +36,7 @@ constexpr uint16_t RETRIES = 3;
 // op
 constexpr uint8_t READ_REQUEST = 0;
 constexpr uint8_t WRITE_REQUEST = 1;
+constexpr uint8_t NO_REQUEST = 0xFF;
 
 // is_req
 constexpr uint8_t CLIENT_REQUEST = 0;

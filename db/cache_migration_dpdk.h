@@ -31,7 +31,7 @@ struct RequestInfo {
   uint64_t start_time = 0;
   uint64_t completed_time = 0;
   int retry_count = 0;
-  uint8_t op = 0;
+  uint8_t op = c_m_proto::NO_REQUEST;
 
   std::atomic<bool> completed;
 
@@ -48,7 +48,7 @@ struct RequestInfo {
     other.start_time = 0;
     other.completed_time = 0;
     other.retry_count = 0;
-    other.op = 0;
+    other.op = c_m_proto::NO_REQUEST;
     other.completed.store(false, std::memory_order_relaxed);
   }
 
@@ -65,10 +65,22 @@ struct RequestInfo {
       other.start_time = 0;
       other.completed_time = 0;
       other.retry_count = 0;
-      other.op = 0;
+      other.op = c_m_proto::NO_REQUEST;
       other.completed.store(false, std::memory_order_relaxed);
     }
     return *this;
+  }
+
+  void clear() {
+    if (mbuf) {
+      rte_pktmbuf_free(mbuf);
+      mbuf = nullptr;
+    }
+    start_time = 0;
+    completed_time = 0;
+    retry_count = 0;
+    op = c_m_proto::NO_REQUEST;
+    completed.store(false, std::memory_order_relaxed);
   }
 
   RequestInfo(const RequestInfo &) = delete;
@@ -117,11 +129,11 @@ class CacheMigrationDpdk : public DB {
   std::vector<std::pair<uint, uint16_t>> rx_cores_;
   std::vector<TxConf> tx_cores_;
   size_t num_tx_cores_ = 0;
-  struct rte_mempool *tx_mbufpool_;
-  struct rte_mempool *rx_mbufpool_;
+  rte_mempool *tx_mbufpool_;
+  rte_mempool *rx_mbufpool_;
   uint8_t port_id_ = 0;
-  struct rte_ether_addr s_eth_addr_;
-  struct rte_ether_addr d_eth_addr_;
+  rte_ether_addr s_eth_addr_;
+  rte_ether_addr d_eth_addr_;
   std::vector<std::pair<rte_be32_t, uint>> src_ips_;
   uint64_t src_ips_size_ = 0;
 
@@ -155,18 +167,18 @@ class CacheMigrationDpdk : public DB {
   inline void AssignCores();
   int PortInit(uint16_t port);
   inline void LaunchThreads();
-  struct rte_mbuf *BuildRequestPacket(const std::string &key, uint8_t op,
-                                      uint32_t req_id,
-                                      const std::vector<KVPair> &values);
+  rte_mbuf *BuildRequestPacket(const std::string &key, uint8_t op,
+                               uint32_t req_id,
+                               const std::vector<KVPair> &values);
 
-  void ProcessReceivedPacket(struct rte_mbuf *mbuf);
-  void RunTimeoutMonitor();
+  // inline void ProcessReceivedPacket(rte_mbuf *mbuf);
+  // void RunTimeoutMonitor();
   static inline int RunTimeoutMonitor(void *arg);
   void DoRx(uint16_t queue_id);
 
   static inline int RxMain(void *arg);
   static inline int TxMain(void *arg);
-  static inline int TimeoutMonitorThread(void *arg);
+  // static inline int TimeoutMonitorThread(void *arg);
 };
 }  // namespace ycsbc
 
