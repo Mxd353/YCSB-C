@@ -385,9 +385,6 @@ inline int CacheMigrationDpdk::RunTimeoutMonitor(void *arg) {
 
           timeout_count.fetch_add(1, std::memory_order_relaxed);
 
-          // rte_mbuf *mbuf = std::exchange(req.mbuf, nullptr);
-          // if (mbuf) rte_pktmbuf_free(mbuf);
-
           continue;
         }
 
@@ -400,7 +397,6 @@ inline int CacheMigrationDpdk::RunTimeoutMonitor(void *arg) {
             }
           } catch (const std::exception &e) {
             std::cerr << "TX burst exception: " << e.what() << std::endl;
-            req.mbuf = nullptr;
           }
         }
       }
@@ -523,8 +519,6 @@ inline int CacheMigrationDpdk::TxMain(void *arg) {
     uint16_t nb_tx = rte_eth_tx_burst(0, queue_id, &mbuf, 1);
     if (nb_tx < 1) {
       requests[i].completed.store(true, std::memory_order_release);
-      // rte_pktmbuf_free(mbuf);
-      // requests[i].mbuf = nullptr;
       false_count.fetch_add(1, std::memory_order_relaxed);
       std::cerr << " send error " << std::endl;
     } else {
