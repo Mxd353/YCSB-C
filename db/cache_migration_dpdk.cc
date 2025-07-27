@@ -37,8 +37,8 @@ static inline void exponentialBackoff(int attempt) {
 }
 
 static inline uint64_t time_out_us(int retry_count) {
-  constexpr uint64_t BASE_TIMEOUT_US = 20'000;
-  constexpr uint64_t MAX_TIMEOUT_US = 500'000;
+  constexpr uint64_t BASE_TIMEOUT_US = 2'000'000;
+  constexpr uint64_t MAX_TIMEOUT_US = 50'000'000;
 
   if (retry_count <= 0) {
     return BASE_TIMEOUT_US;
@@ -190,7 +190,6 @@ void CacheMigrationDpdk::Init(const int thread_id) {
 void CacheMigrationDpdk::Close() {}
 
 void CacheMigrationDpdk::StartDpdk() {
-  std::cout << "start DPDK.." << std::endl;
   for (size_t i = 0; i < requests.size(); ++i) {
     RequestInfo &req = requests[i];
 
@@ -204,10 +203,12 @@ void CacheMigrationDpdk::StartDpdk() {
 
   running = true;
 
-  if (timeout_core_ == UINT_MAX)
-    rte_exit(EXIT_FAILURE,
-             "No dedicated timeout core assigned (timeout_core_ = UINT_MAX)");
+  // if (timeout_core_ == UINT_MAX)
+  //   rte_exit(EXIT_FAILURE,
+  //            "No dedicated timeout core assigned (timeout_core_ =
+  //            UINT_MAX)");
 
+  std::cerr << "start DPDK.." << std::endl;
   LaunchThreads();
 
   while (completed_count + timeout_count + false_count < total_request_count) {
@@ -216,13 +217,13 @@ void CacheMigrationDpdk::StartDpdk() {
   use_time_us = get_now_micros() - send_start_us;
   running = false;
 
-  if (timeout_thread_.joinable()) {
-    timeout_thread_.join();
-  }
+  // if (timeout_thread_.joinable()) {
+  //   timeout_thread_.join();
+  // }
 
-  if (timeout_core_ != UINT_MAX) {
-    rte_eal_wait_lcore(timeout_core_);
-  }
+  // if (timeout_core_ != UINT_MAX) {
+  //   rte_eal_wait_lcore(timeout_core_);
+  // }
 
   std::cout << "All requests completed or timed out." << std::endl;
 }
@@ -244,8 +245,8 @@ inline void CacheMigrationDpdk::AssignCores() {
   rx_cores_.clear();
   tx_cores_.clear();
 
-  size_t rx_count = 6;
-  size_t tx_count = 3;
+  size_t rx_count = (total_workers * 2) / 3;
+  size_t tx_count = total_workers - rx_count;
 
   for (size_t i = 0; i < rx_count; ++i) {
     rx_cores_.push_back(std::make_pair(workers[i], 0));
@@ -259,12 +260,13 @@ inline void CacheMigrationDpdk::AssignCores() {
   printf("Assigned %zu RX cores, %zu TX cores\n", rx_cores_.size(),
          tx_cores_.size());
 
-  timeout_core_ = rx_count + tx_count + 1;
-  if (timeout_core_ == UINT_MAX) {
-    printf("No dedicated timeout core assigned (timeout_core_ = UINT_MAX)\n");
-  } else {
-    printf("Timeout core assigned: %u\n", timeout_core_);
-  }
+  // timeout_core_ = rx_count + tx_count + 1;
+  // if (timeout_core_ == UINT_MAX) {
+  //   printf("No dedicated timeout core assigned (timeout_core_ =
+  //   UINT_MAX)\n");
+  // } else {
+  //   printf("Timeout core assigned: %u\n", timeout_core_);
+  // }
 }
 
 int CacheMigrationDpdk::PortInit(uint16_t port) {
@@ -330,17 +332,18 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
     tx_cores_[q].queue_id = q;
   }
 
-  uint16_t timeout_q = nb_tx_cores + (timeout_core_ != UINT_MAX ? 1 : 0) - 1;
-  if (timeout_q > max_supported_tx_queues) {
-    rte_exit(EXIT_FAILURE, "Too many TX queues requested\n");
-  }
+  // uint16_t timeout_q = nb_tx_cores + (timeout_core_ != UINT_MAX ? 1 : 0) - 1;
+  // if (timeout_q > max_supported_tx_queues) {
+  //   rte_exit(EXIT_FAILURE, "Too many TX queues requested\n");
+  // }
 
-  if (timeout_core_ != UINT_MAX) {
-    retval = rte_eth_tx_queue_setup(port, timeout_q, nb_txd,
-                                    rte_eth_dev_socket_id(port), &txconf);
-    if (retval < 0) rte_exit(EXIT_FAILURE, "Cannot setup timeout TX queue\n");
-    // timeout_queue_ = nb_tx_cores - 1;
-  }
+  // if (timeout_core_ != UINT_MAX) {
+  //   retval = rte_eth_tx_queue_setup(port, timeout_q, nb_txd,
+  //                                   rte_eth_dev_socket_id(port), &txconf);
+  //   if (retval < 0) rte_exit(EXIT_FAILURE, "Cannot setup timeout TX
+  //   queue\n");
+  //   // timeout_queue_ = nb_tx_cores - 1;
+  // }
 
   retval = rte_eth_promiscuous_enable(port);
   if (retval != 0) rte_exit(EXIT_FAILURE, "Cannot set promiscuous\n");
@@ -365,38 +368,32 @@ inline int CacheMigrationDpdk::RunTimeoutMonitor(void *arg) {
   size_t kBatchSize = (end - start) / 10;
 
   while (running.load(std::memory_order_acquire)) {
-    uint64_t now = get_now_micros();
     for (size_t i = start; i < end; i += kBatchSize) {
-      size_t batch_end = std::min(i + batch_end, end);
-      for (size_t j = i; j < end; ++j) {
+      size_t batch_end = std::min(i + kBatchSize, end);
+      uint64_t now = get_now_micros();
+
+      for (size_t j = i; j < batch_end; ++j) {
         RequestInfo &req = requests[j];
 
-        if (req.start_time == 0 ||
-            req.completed.load(std::memory_order_acquire) || !req.mbuf)
-          continue;
+        if (req.completed.load(std::memory_order_acquire)) continue;
 
         uint64_t elapsed_time =
             (now >= req.start_time) ? (now - req.start_time) : 0;
         uint64_t expected_timeout = time_out_us(req.retry_count);
         if (elapsed_time < expected_timeout) continue;
 
-        if (req.retry_count >= kMaxRetries) {
+        if (req.retry_count > kMaxRetries) {
           if (req.completed.exchange(true, std::memory_order_acq_rel)) continue;
-
           timeout_count.fetch_add(1, std::memory_order_relaxed);
-
           continue;
         }
 
-        if (req.mbuf) {
-          try {
-            int sent = rte_eth_tx_burst(0, queue_id, &req.mbuf, 1);
-            if (sent == 1) {
-              timeout_send.fetch_add(1, std::memory_order_relaxed);
-              req.retry_count++;
-            }
-          } catch (const std::exception &e) {
-            std::cerr << "TX burst exception: " << e.what() << std::endl;
+        if (req.mbuf && !req.completed.load(std::memory_order_acquire)) {
+          int sent = rte_eth_tx_burst(0, queue_id, &req.mbuf, 1);
+          if (sent == 1) {
+            timeout_send.fetch_add(1, std::memory_order_relaxed);
+            req.retry_count++;
+            req.start_time = now;
           }
         }
       }
@@ -437,32 +434,32 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
           uint64_t recv_tsc = get_now_micros();
 
           rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(bufs[i], rte_ether_hdr *);
-          if (unlikely(eth_hdr->ether_type !=
-                       rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4))) {
-            continue;
-          }
           rte_ipv4_hdr *ip_hdr = reinterpret_cast<rte_ipv4_hdr *>(eth_hdr + 1);
+
           rte_prefetch0(ip_hdr + 1);
           if (unlikely(ip_hdr->next_proto_id != IP_PROTOCOLS_NETCACHE)) {
             continue;
           }
-          c_m_proto::KVHeader *kv_header = (c_m_proto::KVHeader *)(ip_hdr + 1);
+          c_m_proto::KVHeader *kv_header =
+              reinterpret_cast<c_m_proto::KVHeader *>(ip_hdr + 1);
 
           const uint32_t request_id = rte_be_to_cpu_32(kv_header->request_id);
-
           const uint8_t is_req = GET_IS_REQ(kv_header->combined);
 
           if (is_req != c_m_proto::CACHE_REPLY &&
-              is_req != c_m_proto::SERVER_REPLY)
+              is_req != c_m_proto::SERVER_REPLY) {
+            std::cerr << "Warning: Received SERVER_REJECT: " << request_id
+                      << std::endl;
             continue;
+          }
 
           if (request_id < requests.size()) {
             RequestInfo &req = requests[request_id];
-            if (!req.completed.load(std::memory_order_acquire)) {
-              req.completed.store(true, std::memory_order_release);
+            if (!req.completed.load()) {
+              req.completed.store(true);
               req.completed_time = recv_tsc;
 
-              completed_count.fetch_add(1, std::memory_order_relaxed);
+              // completed_count.fetch_add(1, std::memory_order_relaxed);
               total_latency_us.fetch_add(recv_tsc - req.start_time,
                                          std::memory_order_relaxed);
               if (req.op == c_m_proto::READ_REQUEST)
@@ -475,6 +472,9 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
                       << std::endl;
           }
         }
+
+        completed_count.fetch_add(nb_rx, std::memory_order_relaxed);
+
         rte_pktmbuf_free_bulk(bufs, nb_rx);
       }
     }
@@ -503,26 +503,21 @@ inline int CacheMigrationDpdk::TxMain(void *arg) {
 
   send_start_us = get_now_micros();
   for (size_t i = start; i < end; ++i) {
-    rte_mbuf *mbuf = nullptr;
-    uint64_t start_time;
-
     if (requests[i].completed.load(std::memory_order_acquire)) continue;
 
     if (requests[i].mbuf) {
-      mbuf = requests[i].mbuf;
-      start_time = get_now_micros();
+      requests[i].start_time = get_now_micros();
     } else {
       std::cerr << "Request " << i << " has no mbuf, skipping..." << std::endl;
       continue;
     }
 
-    uint16_t nb_tx = rte_eth_tx_burst(0, queue_id, &mbuf, 1);
+    uint16_t nb_tx = rte_eth_tx_burst(0, queue_id, &requests[i].mbuf, 1);
     if (nb_tx < 1) {
       requests[i].completed.store(true, std::memory_order_release);
       false_count.fetch_add(1, std::memory_order_relaxed);
       std::cerr << " send error " << std::endl;
     } else {
-      requests[i].start_time = start_time;
       tx_success_count += nb_tx;
       rte_delay_us(1);
     }
@@ -533,7 +528,7 @@ inline int CacheMigrationDpdk::TxMain(void *arg) {
             << " drop " << tx_drop_count << " requests (queue " << queue_id
             << ")" << std::endl;
 
-  RunTimeoutMonitor(arg);
+  // RunTimeoutMonitor(arg);
   return 0;
 }
 
