@@ -22,7 +22,7 @@
 #define RX_RING_SIZE 8192
 #define TX_RING_SIZE 4096
 #define TX_RING_COUNT 32
-#define BURST_SIZE 1
+#define BURST_SIZE 32
 
 extern std::atomic<bool> running;
 
