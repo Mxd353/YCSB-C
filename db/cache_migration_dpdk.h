@@ -22,7 +22,7 @@
 #define RX_RING_SIZE 8192
 #define TX_RING_SIZE 4096
 #define TX_RING_COUNT 32
-#define BURST_SIZE 32
+#define BURST_SIZE 1
 
 extern std::atomic<bool> running;
 
@@ -140,10 +140,6 @@ class CacheMigrationDpdk : public DB {
   static thread_local rte_be32_t src_ip_;
   static thread_local uint dev_id_;
 
-  // std::thread timeout_thread_;
-  // uint timeout_core_ = UINT_MAX;
-  // uint16_t timeout_queue_ = 0;
-
   std::atomic<size_t> read_count_{0};
   std::atomic<size_t> read_success_{0};
   std::atomic<size_t> update_count_{0};
@@ -171,14 +167,11 @@ class CacheMigrationDpdk : public DB {
                                uint32_t req_id,
                                const std::vector<KVPair> &values);
 
-  // inline void ProcessReceivedPacket(rte_mbuf *mbuf);
-  // void RunTimeoutMonitor();
   static inline int RunTimeoutMonitor(void *arg);
   void DoRx(uint16_t queue_id);
 
   static inline int RxMain(void *arg);
   static inline int TxMain(void *arg);
-  // static inline int TimeoutMonitorThread(void *arg);
 };
 }  // namespace ycsbc
 

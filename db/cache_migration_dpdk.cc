@@ -37,8 +37,8 @@ static inline void exponentialBackoff(int attempt) {
 }
 
 static inline uint64_t time_out_us(int retry_count) {
-  constexpr uint64_t BASE_TIMEOUT_US = 2'000'000;
-  constexpr uint64_t MAX_TIMEOUT_US = 50'000'000;
+  constexpr uint64_t BASE_TIMEOUT_US = 20'000;
+  constexpr uint64_t MAX_TIMEOUT_US = 500'000;
 
   if (retry_count <= 0) {
     return BASE_TIMEOUT_US;
@@ -130,7 +130,7 @@ CacheMigrationDpdk::CacheMigrationDpdk(utils::Properties &props)
   }
 
   rte_ether_unformat_addr("00:11:22:33:44:55", &s_eth_addr_);
-  rte_ether_unformat_addr("aa:bb:cc:dd:ee:ff", &d_eth_addr_);
+  rte_ether_unformat_addr("b8:3f:d2:08:ab:d2", &d_eth_addr_);
 
   std::cout << "+++++++++++++++++++++++++++++++++\n";
 }
@@ -217,15 +217,7 @@ void CacheMigrationDpdk::StartDpdk() {
   use_time_us = get_now_micros() - send_start_us;
   running = false;
 
-  // if (timeout_thread_.joinable()) {
-  //   timeout_thread_.join();
-  // }
-
-  // if (timeout_core_ != UINT_MAX) {
-  //   rte_eal_wait_lcore(timeout_core_);
-  // }
-
-  std::cout << "All requests completed or timed out." << std::endl;
+  std::cerr << "All requests completed or timed out." << std::endl;
 }
 
 inline void CacheMigrationDpdk::AssignCores() {
@@ -259,14 +251,6 @@ inline void CacheMigrationDpdk::AssignCores() {
   num_tx_cores_ = tx_cores_.size();
   printf("Assigned %zu RX cores, %zu TX cores\n", rx_cores_.size(),
          tx_cores_.size());
-
-  // timeout_core_ = rx_count + tx_count + 1;
-  // if (timeout_core_ == UINT_MAX) {
-  //   printf("No dedicated timeout core assigned (timeout_core_ =
-  //   UINT_MAX)\n");
-  // } else {
-  //   printf("Timeout core assigned: %u\n", timeout_core_);
-  // }
 }
 
 int CacheMigrationDpdk::PortInit(uint16_t port) {
@@ -332,19 +316,6 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
     tx_cores_[q].queue_id = q;
   }
 
-  // uint16_t timeout_q = nb_tx_cores + (timeout_core_ != UINT_MAX ? 1 : 0) - 1;
-  // if (timeout_q > max_supported_tx_queues) {
-  //   rte_exit(EXIT_FAILURE, "Too many TX queues requested\n");
-  // }
-
-  // if (timeout_core_ != UINT_MAX) {
-  //   retval = rte_eth_tx_queue_setup(port, timeout_q, nb_txd,
-  //                                   rte_eth_dev_socket_id(port), &txconf);
-  //   if (retval < 0) rte_exit(EXIT_FAILURE, "Cannot setup timeout TX
-  //   queue\n");
-  //   // timeout_queue_ = nb_tx_cores - 1;
-  // }
-
   retval = rte_eth_promiscuous_enable(port);
   if (retval != 0) rte_exit(EXIT_FAILURE, "Cannot set promiscuous\n");
 
@@ -366,6 +337,9 @@ inline int CacheMigrationDpdk::RunTimeoutMonitor(void *arg) {
   constexpr uint64_t kSleepIntervalUs = 1000;
   const uint16_t kMaxRetries = c_m_proto::RETRIES;
   size_t kBatchSize = (end - start) / 10;
+
+  std::cerr << "Start Timeout Monitor on lcore: " << rte_lcore_id()
+            << std::endl;
 
   while (running.load(std::memory_order_acquire)) {
     for (size_t i = start; i < end; i += kBatchSize) {
@@ -391,6 +365,7 @@ inline int CacheMigrationDpdk::RunTimeoutMonitor(void *arg) {
         if (req.mbuf && !req.completed.load(std::memory_order_acquire)) {
           int sent = rte_eth_tx_burst(0, queue_id, &req.mbuf, 1);
           if (sent == 1) {
+            // std::cerr << "Time out send" << std::endl;
             timeout_send.fetch_add(1, std::memory_order_relaxed);
             req.retry_count++;
             req.start_time = now;
@@ -422,12 +397,12 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
           "not be optimal.\n",
           port);
 
-    rte_mbuf *bufs[BURST_SIZE];
+    rte_mbuf *bufs[32];
 
     while (running.load(std::memory_order_acquire)) {
-      nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
+      nb_rx = rte_eth_rx_burst(port, queue_id, bufs, 32);
 
-      if (unlikely(nb_rx <= 0)) {
+      if (unlikely(nb_rx == 0)) {
         continue;
       } else {
         for (uint16_t i = 0; i < nb_rx; i++) {
@@ -446,20 +421,21 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
           const uint32_t request_id = rte_be_to_cpu_32(kv_header->request_id);
           const uint8_t is_req = GET_IS_REQ(kv_header->combined);
 
-          if (is_req != c_m_proto::CACHE_REPLY &&
-              is_req != c_m_proto::SERVER_REPLY) {
-            std::cerr << "Warning: Received SERVER_REJECT: " << request_id
-                      << std::endl;
+          if (unlikely(is_req != c_m_proto::CACHE_REPLY &&
+                       is_req != c_m_proto::SERVER_REPLY)) {
+            std::cerr << "Warning: Received "
+                      << (is_req == c_m_proto::CACHE_REPLY ? "CACHE_REPLY "
+                                                           : "SERVER_REJECT ")
+                      << request_id << std::endl;
             continue;
           }
 
           if (request_id < requests.size()) {
             RequestInfo &req = requests[request_id];
-            if (!req.completed.load()) {
-              req.completed.store(true);
+            if (!req.completed.exchange(true, std::memory_order_acq_rel)) {
               req.completed_time = recv_tsc;
 
-              // completed_count.fetch_add(1, std::memory_order_relaxed);
+              completed_count.fetch_add(1, std::memory_order_relaxed);
               total_latency_us.fetch_add(recv_tsc - req.start_time,
                                          std::memory_order_relaxed);
               if (req.op == c_m_proto::READ_REQUEST)
@@ -471,14 +447,12 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
             std::cerr << "Warning: Received req_id out of range: " << request_id
                       << std::endl;
           }
+          rte_pktmbuf_free(bufs[i]);
         }
 
-        completed_count.fetch_add(nb_rx, std::memory_order_relaxed);
-
-        rte_pktmbuf_free_bulk(bufs, nb_rx);
+        // completed_count.fetch_add(nb_rx, std::memory_order_relaxed);
       }
     }
-    return;
   } else {
     printf("Skip main lcore %u\n", lcore_id);
   }
@@ -512,6 +486,19 @@ inline int CacheMigrationDpdk::TxMain(void *arg) {
       continue;
     }
 
+    // rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(requests[i].mbuf, rte_ether_hdr
+    // *); rte_ipv4_hdr *ip_hdr = reinterpret_cast<rte_ipv4_hdr *>(eth_hdr + 1);
+
+    //  uint32_t dst_ip = rte_be_to_cpu_32(ip_hdr->dst_addr);
+
+    // // 判断目的 IP 地址是否是 192.168.4.2、192.168.5.2 或 192.168.6.2
+    // if (dst_ip == rte_be_to_cpu_32(inet_addr("192.168.4.2")) ||
+    //     dst_ip == rte_be_to_cpu_32(inet_addr("192.168.5.2")) ||
+    //     dst_ip == rte_be_to_cpu_32(inet_addr("192.168.6.2"))) {
+    //     std::cerr << "Target IP matched: " << dst_ip << std::endl;
+    //     // 执行特定操作
+    // }
+
     uint16_t nb_tx = rte_eth_tx_burst(0, queue_id, &requests[i].mbuf, 1);
     if (nb_tx < 1) {
       requests[i].completed.store(true, std::memory_order_release);
@@ -528,15 +515,9 @@ inline int CacheMigrationDpdk::TxMain(void *arg) {
             << " drop " << tx_drop_count << " requests (queue " << queue_id
             << ")" << std::endl;
 
-  // RunTimeoutMonitor(arg);
+  RunTimeoutMonitor(arg);
   return 0;
 }
-
-// inline int CacheMigrationDpdk::TimeoutMonitorThread(void *arg) {
-//   auto *self = static_cast<CacheMigrationDpdk *>(arg);
-//   self->RunTimeoutMonitor();
-//   return 0;
-// }
 
 inline void CacheMigrationDpdk::LaunchThreads() {
   rx_args_.clear();
@@ -587,16 +568,6 @@ inline void CacheMigrationDpdk::LaunchThreads() {
       return;
     }
   }
-
-  // if (timeout_core_ != UINT_MAX) {
-  //   int ret = rte_eal_remote_launch(TimeoutMonitorThread, this,
-  //   timeout_core_); if (ret < 0) {
-  //     std::cerr << "Failed to launch TimeoutMonitor thread on core "
-  //               << timeout_core_ << ", error: " << rte_strerror(-ret)
-  //               << std::endl;
-  //     return;
-  //   }
-  // }
 }
 
 rte_mbuf *CacheMigrationDpdk::BuildRequestPacket(
@@ -637,15 +608,15 @@ rte_mbuf *CacheMigrationDpdk::BuildRequestPacket(
   uint16_t combined = ENCODE_COMBINED(dev_id_, op);
   kv_header->request_id = rte_cpu_to_be_32(req_id);
   kv_header->combined = rte_cpu_to_be_16(combined);
-  memcpy(kv_header->key.data(), key.data(), c_m_proto::KEY_LENGTH);
-  memcpy(kv_header->value1.data(), values[0].second.data(),
-         c_m_proto::VALUE_LENGTH);
-  memcpy(kv_header->value2.data(), values[1].second.data(),
-         c_m_proto::VALUE_LENGTH);
-  memcpy(kv_header->value3.data(), values[2].second.data(),
-         c_m_proto::VALUE_LENGTH);
-  memcpy(kv_header->value4.data(), values[3].second.data(),
-         c_m_proto::VALUE_LENGTH);
+  rte_memcpy(kv_header->key.data(), key.data(), c_m_proto::KEY_LENGTH);
+  rte_memcpy(kv_header->value1.data(), values[0].second.data(),
+             c_m_proto::VALUE_LENGTH);
+  rte_memcpy(kv_header->value2.data(), values[1].second.data(),
+             c_m_proto::VALUE_LENGTH);
+  rte_memcpy(kv_header->value3.data(), values[2].second.data(),
+             c_m_proto::VALUE_LENGTH);
+  rte_memcpy(kv_header->value4.data(), values[3].second.data(),
+             c_m_proto::VALUE_LENGTH);
   return mbuf;
 }
 
