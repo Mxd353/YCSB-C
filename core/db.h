@@ -26,7 +26,10 @@ class DB {
   void SetName(const std::string &name) { name_ = name; }
   const std::string &GetName() const { return name_; }
 
-  virtual void AllocateSpace(size_t total_ops) { (void)total_ops; }
+  virtual void AllocateSpace(size_t total_ops, size_t req_size) {
+    (void)total_ops;
+    (void)req_size;
+  }
   ///
   /// Initializes any state for accessing this DB.
   /// Called once per DB client (thread); there is a single DB instance

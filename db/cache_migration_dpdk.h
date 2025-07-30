@@ -23,63 +23,47 @@
 #define TX_RING_SIZE 4096
 #define TX_RING_COUNT 32
 #define BURST_SIZE 32
+#define REQ_SIZE 100'000'000
 
 extern std::atomic<bool> running;
 
 struct RequestInfo {
-  rte_mbuf *mbuf = nullptr;
   uint64_t start_time = 0;
-  uint64_t completed_time = 0;
-  int retry_count = 0;
-  uint8_t op = c_m_proto::NO_REQUEST;
 
+  std::atomic<int> retry_count;
   std::atomic<bool> completed;
 
-  RequestInfo() : completed(false) {}
+  RequestInfo() :  retry_count(0), completed(false){}
 
   RequestInfo(RequestInfo &&other) noexcept
-      : mbuf(other.mbuf),
-        start_time(other.start_time),
-        completed_time(other.completed_time),
-        retry_count(other.retry_count),
-        op(other.op),
+      : start_time(other.start_time),
+        retry_count(other.retry_count.load(std::memory_order_relaxed)),
         completed(other.completed.load(std::memory_order_relaxed)) {
-    other.mbuf = nullptr;
     other.start_time = 0;
-    other.completed_time = 0;
-    other.retry_count = 0;
-    other.op = c_m_proto::NO_REQUEST;
+
+    other.retry_count.store(0, std::memory_order_relaxed);
     other.completed.store(false, std::memory_order_relaxed);
   }
 
   RequestInfo &operator=(RequestInfo &&other) noexcept {
     if (this != &other) {
-      mbuf = other.mbuf;
       start_time = other.start_time;
-      completed_time = other.completed_time;
-      retry_count = other.retry_count;
-      op = other.op;
+
+      retry_count.store(other.retry_count.load(std::memory_order_relaxed));
       completed.store(other.completed.load(std::memory_order_relaxed));
 
-      other.mbuf = nullptr;
       other.start_time = 0;
-      other.completed_time = 0;
-      other.retry_count = 0;
-      other.op = c_m_proto::NO_REQUEST;
+
+      other.retry_count.store(0, std::memory_order_relaxed);
       other.completed.store(false, std::memory_order_relaxed);
     }
     return *this;
   }
 
   void clear() {
-    if (mbuf) {
-      rte_pktmbuf_free(mbuf);
-      mbuf = nullptr;
-    }
     start_time = 0;
-    completed_time = 0;
-    retry_count = 0;
-    op = c_m_proto::NO_REQUEST;
+
+    retry_count.store(0, std::memory_order_relaxed);
     completed.store(false, std::memory_order_relaxed);
   }
 
@@ -104,7 +88,7 @@ class CacheMigrationDpdk : public DB {
 
   CacheMigrationDpdk(utils::Properties &props);
   ~CacheMigrationDpdk();
-  void AllocateSpace(size_t total_ops) override;
+  void AllocateSpace(size_t total_ops, size_t req_size) override;
   void Init(const int thread_id) override;
   void Close() override;
   void StartDpdk();
@@ -139,13 +123,6 @@ class CacheMigrationDpdk : public DB {
 
   static thread_local rte_be32_t src_ip_;
   static thread_local uint dev_id_;
-
-  std::atomic<size_t> read_count_{0};
-  std::atomic<size_t> read_success_{0};
-  std::atomic<size_t> update_count_{0};
-  std::atomic<size_t> update_success_{0};
-  std::atomic<size_t> no_result_{0};
-  std::atomic<size_t> update_failed_{0};
 
   std::vector<KVPair> DEFAULT_VALUES = {{"field0", "read"},
                                         {"field1", "read"},

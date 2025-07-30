@@ -79,7 +79,8 @@ int main(const int argc, const char *argv[]) {
   if (load) {
     // Loads data
     total_ops = stoi(props[ycsbc::CoreWorkload::RECORD_COUNT_PROPERTY]);
-    db->AllocateSpace(total_ops);
+    db->AllocateSpace(total_ops, total_ops);
+    
     int threads_to_launch = std::min(num_threads, total_ops);
     int ops_per_thread = total_ops / threads_to_launch;
     int remaining_ops = total_ops % threads_to_launch;
@@ -140,7 +141,7 @@ int main(const int argc, const char *argv[]) {
 
   actual_ops.clear();
   total_ops = stoi(props[ycsbc::CoreWorkload::OPERATION_COUNT_PROPERTY]);
-  db->AllocateSpace(total_ops);
+  db->AllocateSpace(total_ops, REQ_SIZE);
   int threads_to_launch = std::min(num_threads, total_ops);
   int ops_per_thread = total_ops / threads_to_launch;
 
