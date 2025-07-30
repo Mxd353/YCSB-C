@@ -397,10 +397,10 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
           "not be optimal.\n",
           port);
 
-    rte_mbuf *bufs[32];
+    rte_mbuf *bufs[BURST_SIZE];
 
     while (running.load(std::memory_order_acquire)) {
-      nb_rx = rte_eth_rx_burst(port, queue_id, bufs, 32);
+      nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
 
       if (unlikely(nb_rx == 0)) {
         continue;
