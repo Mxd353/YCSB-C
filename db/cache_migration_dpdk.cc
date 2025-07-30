@@ -159,6 +159,7 @@ CacheMigrationDpdk::~CacheMigrationDpdk() {
     rx_mbufpool_ = nullptr;
   }
   requests.clear();
+  packets.clear();
 
   std::cout << "CacheMigrationDpdk resources cleaned up." << std::endl;
 }
@@ -182,9 +183,7 @@ void CacheMigrationDpdk::AllocateSpace(size_t total_ops, size_t req_size) {
   requests.resize(req_size);
 
   packets.clear();
-  packets.resize(total_request_count);
-
-  requests_per_packet = requests.size() / packets.size();
+  packets.reserve(total_request_count);
 }
 
 void CacheMigrationDpdk::Init(const int thread_id) {
@@ -202,14 +201,19 @@ void CacheMigrationDpdk::Init(const int thread_id) {
 void CacheMigrationDpdk::Close() {}
 
 void CacheMigrationDpdk::StartDpdk() {
-  for (size_t i = 0; i < requests.size(); ++i) {
-    RequestInfo &req = requests[i];
-
+  for (auto &req : requests) {
     if (req.completed.load(std::memory_order_acquire)) {
-      rte_exit(EXIT_FAILURE,
-               "Request %zu is not completed and mbuf is nullptr!", i);
+      rte_exit(EXIT_FAILURE, "Have not completed!");
     }
   }
+
+  for (auto pkt : packets) {
+    if (!pkt) {
+      rte_exit(EXIT_FAILURE, "Have mbuf is nullptr!");
+    }
+  }
+
+  requests_per_packet = requests.size() / packets.size();
 
   std::cerr << "All " << requests.size() << " requests valid." << std::endl;
 
@@ -300,8 +304,8 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
     printf("WARNING: RSS_IP not supported, falling back to single queue.\n");
   }
 
-  if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
-    port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+  // if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
+  //   port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 
   retval =
       rte_eth_dev_configure(port, nb_rx_cores, nb_tx_cores + 1, &port_conf);
@@ -378,7 +382,14 @@ inline int CacheMigrationDpdk::RunTimeoutMonitor(void *arg) {
           continue;
         }
 
-        rte_mbuf *packet = packets[request_id / requests_per_packet];
+        size_t packet_index = request_id % requests_per_packet;
+        if (packet_index >= packets.size()) {
+          std::cerr
+              << "Error: Attempt to access an out-of-bounds packet index: "
+              << packet_index << " limit: " << packets.size() << std::endl;
+          continue;
+        }
+        rte_mbuf *packet = packets[packet_index];
 
         if (packet && !req.completed.load(std::memory_order_acquire)) {
           int sent = rte_eth_tx_burst(0, queue_id, &packet, 1);
@@ -495,11 +506,14 @@ inline int CacheMigrationDpdk::TxMain(void *arg) {
   for (size_t request_id = start; request_id < end; ++request_id) {
     requests[request_id].start_time = get_now_micros();
 
-    rte_mbuf *packet = packets[request_id / requests_per_packet];
+    rte_mbuf *packet = packets[request_id % requests_per_packet];
 
-    c_m_proto::KVHeader *kv_header =
-        rte_pktmbuf_mtod(packet + RTE_ETHER_HDR_LEN + c_m_proto::IPV4_HDR_LEN,
-                         c_m_proto::KVHeader *);
+    c_m_proto::KVHeader *kv_header = reinterpret_cast<c_m_proto::KVHeader *>(
+        packet + RTE_ETHER_HDR_LEN + c_m_proto::IPV4_HDR_LEN);
+    if (unlikely(kv_header == nullptr)) {
+      std::cerr << "Error: Invalid KVHeader pointer" << std::endl;
+      continue;
+    }
 
     kv_header->request_id = rte_cpu_to_be_32(request_id);
 
@@ -601,8 +615,7 @@ rte_mbuf *CacheMigrationDpdk::BuildRequestPacket(
   rte_ether_addr_copy(&d_eth_addr_, &eth_hdr->dst_addr);
   eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
 
-  rte_ipv4_hdr *ip_hdr =
-      reinterpret_cast<rte_ipv4_hdr *>(pkt_data + RTE_ETHER_HDR_LEN);
+  rte_ipv4_hdr *ip_hdr = reinterpret_cast<rte_ipv4_hdr *>(eth_hdr + 1);
   ip_hdr->ihl = 5;
   ip_hdr->version = 4;
   ip_hdr->type_of_service = 0;
@@ -616,8 +629,8 @@ rte_mbuf *CacheMigrationDpdk::BuildRequestPacket(
   ip_hdr->hdr_checksum = 0;
   ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
 
-  c_m_proto::KVHeader *kv_header = reinterpret_cast<c_m_proto::KVHeader *>(
-      pkt_data + RTE_ETHER_HDR_LEN + c_m_proto::IPV4_HDR_LEN);
+  c_m_proto::KVHeader *kv_header =
+      reinterpret_cast<c_m_proto::KVHeader *>(ip_hdr + 1);
   uint16_t combined = ENCODE_COMBINED(dev_id, op);
   kv_header->request_id = rte_cpu_to_be_32(req_id);
   kv_header->combined = rte_cpu_to_be_16(combined);
@@ -691,7 +704,13 @@ void CacheMigrationDpdk::PrintStats() {
   utils::RequestIDGenerator::reset();
 
   for (auto pkt : packets) {
+    if (pkt == nullptr) {
+      std::cerr << "Error: Attempt to free a null pointer" << std::endl;
+      continue;
+    }
+
     rte_pktmbuf_free(pkt);
+    pkt = nullptr;
   }
 
   for (auto &req : requests) {
