@@ -212,7 +212,10 @@ void CacheMigrationDpdk::StartDpdk() {
   LaunchThreads();
 
   while (completed_count + timeout_count + false_count < total_request_count) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    utils::monitor_mempool(rx_mbufpool_);
+     utils::monitor_mempool(tx_mbufpool_);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
   }
   use_time_us = get_now_micros() - send_start_us;
   running = false;
@@ -288,11 +291,11 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
     printf("WARNING: RSS_IP not supported, falling back to single queue.\n");
   }
 
-  if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
-    port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+  // if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
+  //   port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
 
   retval =
-      rte_eth_dev_configure(port, nb_rx_cores, nb_tx_cores + 1, &port_conf);
+      rte_eth_dev_configure(port, nb_rx_cores, nb_tx_cores, &port_conf);
   if (retval != 0) rte_exit(EXIT_FAILURE, "Cannot configure port\n");
 
   retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, &nb_txd);
@@ -338,8 +341,8 @@ inline int CacheMigrationDpdk::RunTimeoutMonitor(void *arg) {
   const uint16_t kMaxRetries = c_m_proto::RETRIES;
   size_t kBatchSize = (end - start) / 10;
 
-  std::cerr << "Start Timeout Monitor on lcore: " << rte_lcore_id()
-            << std::endl;
+  //std::cerr << "Start Timeout Monitor on lcore: " << rte_lcore_id()
+            //<< std::endl;
 
   while (running.load(std::memory_order_acquire)) {
     for (size_t i = start; i < end; i += kBatchSize) {
@@ -361,7 +364,7 @@ inline int CacheMigrationDpdk::RunTimeoutMonitor(void *arg) {
           timeout_count.fetch_add(1, std::memory_order_relaxed);
           continue;
         }
-
+ if (rte_mbuf_refcnt_read(req.mbuf) == 0) std::cerr << "!!!" << std::endl;
         if (req.mbuf && !req.completed.load(std::memory_order_acquire)) {
           int sent = rte_eth_tx_burst(0, queue_id, &req.mbuf, 1);
           if (sent == 1) {
@@ -406,6 +409,7 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
         continue;
       } else {
         for (uint16_t i = 0; i < nb_rx; i++) {
+
           uint64_t recv_tsc = get_now_micros();
 
           rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(bufs[i], rte_ether_hdr *);
@@ -413,6 +417,7 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
 
           rte_prefetch0(ip_hdr + 1);
           if (unlikely(ip_hdr->next_proto_id != IP_PROTOCOLS_NETCACHE)) {
+            rte_pktmbuf_free(bufs[i]);
             continue;
           }
           c_m_proto::KVHeader *kv_header =
@@ -421,12 +426,15 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
           const uint32_t request_id = rte_be_to_cpu_32(kv_header->request_id);
           const uint8_t is_req = GET_IS_REQ(kv_header->combined);
 
+          rte_pktmbuf_free(bufs[i]);
+
           if (unlikely(is_req != c_m_proto::CACHE_REPLY &&
                        is_req != c_m_proto::SERVER_REPLY)) {
             std::cerr << "Warning: Received "
                       << (is_req == c_m_proto::CACHE_REPLY ? "CACHE_REPLY "
                                                            : "SERVER_REJECT ")
                       << request_id << std::endl;
+
             continue;
           }
 
@@ -449,8 +457,6 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
           }
           rte_pktmbuf_free(bufs[i]);
         }
-
-        // completed_count.fetch_add(nb_rx, std::memory_order_relaxed);
       }
     }
   } else {
@@ -477,36 +483,21 @@ inline int CacheMigrationDpdk::TxMain(void *arg) {
 
   send_start_us = get_now_micros();
   for (size_t i = start; i < end; ++i) {
-    if (requests[i].completed.load(std::memory_order_acquire)) continue;
-
     if (requests[i].mbuf) {
       requests[i].start_time = get_now_micros();
     } else {
       std::cerr << "Request " << i << " has no mbuf, skipping..." << std::endl;
       continue;
     }
-
-    // rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(requests[i].mbuf, rte_ether_hdr
-    // *); rte_ipv4_hdr *ip_hdr = reinterpret_cast<rte_ipv4_hdr *>(eth_hdr + 1);
-
-    //  uint32_t dst_ip = rte_be_to_cpu_32(ip_hdr->dst_addr);
-
-    // // 判断目的 IP 地址是否是 192.168.4.2、192.168.5.2 或 192.168.6.2
-    // if (dst_ip == rte_be_to_cpu_32(inet_addr("192.168.4.2")) ||
-    //     dst_ip == rte_be_to_cpu_32(inet_addr("192.168.5.2")) ||
-    //     dst_ip == rte_be_to_cpu_32(inet_addr("192.168.6.2"))) {
-    //     std::cerr << "Target IP matched: " << dst_ip << std::endl;
-    //     // 执行特定操作
-    // }
-
     uint16_t nb_tx = rte_eth_tx_burst(0, queue_id, &requests[i].mbuf, 1);
+
     if (nb_tx < 1) {
       requests[i].completed.store(true, std::memory_order_release);
       false_count.fetch_add(1, std::memory_order_relaxed);
       std::cerr << " send error " << std::endl;
     } else {
       tx_success_count += nb_tx;
-      rte_delay_us(1);
+      rte_delay_us(10);
     }
 
     tx_drop_count += (1 - nb_tx);

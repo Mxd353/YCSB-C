@@ -9,6 +9,9 @@
 #ifndef YCSB_C_UTILS_H_
 #define YCSB_C_UTILS_H_
 
+#include <rte_log.h>
+#include <rte_mbuf.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -109,6 +112,15 @@ static inline uint32_t generate_request_id(uint32_t thread_id) {
   thread_local static uint32_t local_counter = 0;
 
   return thread_id * MAX_REQ_PER_THREAD + local_counter++;
+}
+
+inline void monitor_mempool(struct rte_mempool *mp) {
+  unsigned avail = rte_mempool_avail_count(mp);
+  unsigned in_use = rte_mempool_in_use_count(mp);
+  double use_percent = (double)in_use * 100.0 / (double)mp->size;
+
+  RTE_LOG(NOTICE, MEMPOOL, "Status: Available=%u, In_use=%u (%.1f%%)\n", avail,
+          in_use, use_percent);
 }
 
 }  // namespace utils
