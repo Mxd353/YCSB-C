@@ -437,19 +437,24 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
         for (uint16_t i = 0; i < nb_rx; i++) {
           uint64_t recv_tsc = get_now_micros();
 
-          rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(bufs[i], rte_ether_hdr *);
-          rte_ipv4_hdr *ip_hdr = reinterpret_cast<rte_ipv4_hdr *>(eth_hdr + 1);
+          // rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(bufs[i], rte_ether_hdr
+          // *); rte_ipv4_hdr *ip_hdr = reinterpret_cast<rte_ipv4_hdr *>(eth_hdr
+          // + 1);
 
-          rte_prefetch0(ip_hdr + 1);
-          if (unlikely(ip_hdr->next_proto_id != IP_PROTOCOLS_NETCACHE)) {
-            continue;
-          }
+          // rte_prefetch0(ip_hdr + 1);
+          // if (unlikely(ip_hdr->next_proto_id != IP_PROTOCOLS_NETCACHE)) {
+          //   continue;
+          // }
+
           c_m_proto::KVHeader *kv_header =
-              reinterpret_cast<c_m_proto::KVHeader *>(ip_hdr + 1);
+              reinterpret_cast<c_m_proto::KVHeader *>(
+                  bufs[i] + RTE_ETHER_HDR_LEN + c_m_proto::IPV4_HDR_LEN);
 
           const uint32_t request_id = rte_be_to_cpu_32(kv_header->request_id);
           const uint8_t is_req = GET_IS_REQ(kv_header->combined);
           const uint8_t op = GET_OP(kv_header->combined);
+
+          rte_pktmbuf_free(bufs[i]);
 
           if (unlikely(is_req != c_m_proto::CACHE_REPLY &&
                        is_req != c_m_proto::SERVER_REPLY)) {
@@ -466,18 +471,19 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
               completed_count.fetch_add(1, std::memory_order_relaxed);
               total_latency_us.fetch_add(recv_tsc - req.start_time,
                                          std::memory_order_relaxed);
-              if (op == c_m_proto::READ_REQUEST)
-                read_success.fetch_add(1, std::memory_order_relaxed);
-              else if (op == c_m_proto::WRITE_REQUEST)
-                update_success.fetch_add(1, std::memory_order_relaxed);
+
+              (op == c_m_proto::READ_REQUEST ? read_success : update_success)
+                  .fetch_add(1, std::memory_order_relaxed);
+              // if (op == c_m_proto::READ_REQUEST)
+              //   read_success.fetch_add(1, std::memory_order_relaxed);
+              // else if (op == c_m_proto::WRITE_REQUEST)
+              //   update_success.fetch_add(1, std::memory_order_relaxed);
             }
           } else {
             std::cerr << "Warning: Received req_id out of range: " << request_id
                       << std::endl;
           }
         }
-        rte_pktmbuf_free_bulk(bufs, nb_rx);
-        // completed_count.fetch_add(nb_rx, std::memory_order_relaxed);
       }
     }
   } else {
