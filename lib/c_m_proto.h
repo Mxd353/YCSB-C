@@ -31,7 +31,7 @@ namespace c_m_proto {
 constexpr size_t KEY_LENGTH = 16;
 constexpr size_t VALUE_LENGTH = 4;
 
-constexpr uint16_t RETRIES = 3;
+constexpr uint16_t RETRIES = 5;
 
 // op
 constexpr uint8_t READ_REQUEST = 0;
@@ -121,8 +121,8 @@ struct AskPacket : public BaseHeader {
 };
 #pragma pack(pop)
 
-constexpr uint16_t IPV4_HDR_LEN = sizeof(struct rte_ipv4_hdr);
-constexpr uint16_t C_M_HDR_LEN = sizeof(struct KVHeader);
+constexpr uint16_t IPV4_HDR_LEN = sizeof(rte_ipv4_hdr);
+constexpr uint16_t C_M_HDR_LEN = sizeof(KVHeader);
 
 const uint16_t TOTAL_LEN = RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + C_M_HDR_LEN;
 template <typename T>

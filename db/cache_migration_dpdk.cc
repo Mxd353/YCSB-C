@@ -455,18 +455,11 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
         for (uint16_t i = 0; i < nb_rx; i++) {
           uint64_t recv_tsc = get_now_micros();
 
-          // rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(bufs[i], rte_ether_hdr
-          // *); rte_ipv4_hdr *ip_hdr = reinterpret_cast<rte_ipv4_hdr *>(eth_hdr
-          // + 1);
-
-          // rte_prefetch0(ip_hdr + 1);
-          // if (unlikely(ip_hdr->next_proto_id != IP_PROTOCOLS_NETCACHE)) {
-          //   continue;
-          // }
+          rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(bufs[i], rte_ether_hdr *);
+          rte_ipv4_hdr *ip_hdr = reinterpret_cast<rte_ipv4_hdr *>(eth_hdr + 1);
 
           c_m_proto::KVHeader *kv_header =
-              reinterpret_cast<c_m_proto::KVHeader *>(
-                  bufs[i] + RTE_ETHER_HDR_LEN + c_m_proto::IPV4_HDR_LEN);
+              reinterpret_cast<c_m_proto::KVHeader *>(ip_hdr + 1);
 
           const uint32_t request_id = rte_be_to_cpu_32(kv_header->request_id);
           const uint8_t is_req = GET_IS_REQ(kv_header->combined);
@@ -532,8 +525,11 @@ inline int CacheMigrationDpdk::TxMain(void *arg) {
 
     rte_mbuf *packet = packets[request_id % requests_per_packet];
 
-    c_m_proto::KVHeader *kv_header = reinterpret_cast<c_m_proto::KVHeader *>(
-        packet + RTE_ETHER_HDR_LEN + c_m_proto::IPV4_HDR_LEN);
+    rte_ether_hdr *eth_hdr = rte_pktmbuf_mtod(packet, rte_ether_hdr *);
+    rte_ipv4_hdr *ip_hdr = reinterpret_cast<rte_ipv4_hdr *>(eth_hdr + 1);
+
+    c_m_proto::KVHeader *kv_header =
+        reinterpret_cast<c_m_proto::KVHeader *>(ip_hdr + 1);
     if (unlikely(kv_header == nullptr)) {
       std::cerr << "Error: Invalid KVHeader pointer" << std::endl;
       continue;
