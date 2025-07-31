@@ -20,7 +20,7 @@ static std::vector<RequestInfo> requests;
 static std::vector<rte_mbuf *> packets;
 int requests_per_packet;
 
-std::atomic<uint32_t> utils::RequestIDGenerator::counter{0};
+// std::atomic<uint32_t> utils::RequestIDGenerator::counter{0};
 
 uint64_t send_start_us = 0;
 uint64_t use_time_us = 0;
@@ -150,6 +150,17 @@ CacheMigrationDpdk::~CacheMigrationDpdk() {
   rte_eth_dev_stop(port);
   rte_eth_dev_close(port);
 
+  requests.clear();
+  for (auto pkt : packets) {
+    if (pkt == nullptr) {
+      continue;
+    }
+
+    rte_pktmbuf_free(pkt);
+    pkt = nullptr;
+  }
+  packets.clear();
+
   if (tx_mbufpool_) {
     rte_mempool_free(tx_mbufpool_);
     tx_mbufpool_ = nullptr;
@@ -158,8 +169,6 @@ CacheMigrationDpdk::~CacheMigrationDpdk() {
     rte_mempool_free(rx_mbufpool_);
     rx_mbufpool_ = nullptr;
   }
-  requests.clear();
-  packets.clear();
 
   std::cout << "CacheMigrationDpdk resources cleaned up." << std::endl;
 }
@@ -182,6 +191,15 @@ void CacheMigrationDpdk::AllocateSpace(size_t total_ops, size_t req_size) {
   requests.clear();
   requests.resize(req_size);
 
+  for (auto pkt : packets) {
+    if (pkt == nullptr) {
+      std::cerr << "Error: Attempt to free a null pointer" << std::endl;
+      continue;
+    }
+
+    rte_pktmbuf_free(pkt);
+    pkt = nullptr;
+  }
   packets.clear();
   packets.reserve(total_request_count);
 }
@@ -707,23 +725,7 @@ int CacheMigrationDpdk::Delete(const std::string &table,
 }
 
 void CacheMigrationDpdk::PrintStats() {
-  utils::RequestIDGenerator::reset();
-
-  for (auto pkt : packets) {
-    if (pkt == nullptr) {
-      std::cerr << "Error: Attempt to free a null pointer" << std::endl;
-      continue;
-    }
-
-    rte_pktmbuf_free(pkt);
-    pkt = nullptr;
-  }
-
-  for (auto &req : requests) {
-    req.clear();
-  }
-
-  requests.clear();
+  // utils::RequestIDGenerator::reset();
 
   uint64_t completed = completed_count.load(std::memory_order_relaxed);
   uint64_t total_latency = total_latency_us.load(std::memory_order_relaxed);
