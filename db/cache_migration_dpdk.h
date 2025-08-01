@@ -18,12 +18,14 @@
 #define RX_NUM_MBUFS 262'143
 #define MBUF_CACHE_SIZE 512
 #define TX_MBUF_DATA_SIZE 256
-#define RX_MBUF_DATA_SIZE 2048
+#define RX_MBUF_DATA_SIZE 512
 #define RX_RING_SIZE 8192
 #define TX_RING_SIZE 4096
 #define TX_RING_COUNT 32
 #define BURST_SIZE 32
 #define REQ_SIZE 100'000'000
+
+#define RTE_LOGTYPE_CORE RTE_LOGTYPE_USER3
 
 extern std::atomic<bool> running;
 
@@ -32,17 +34,20 @@ struct RequestInfo {
 
   std::atomic<int> retry_count;
   std::atomic<bool> completed;
+  std::atomic<bool> time_out;
 
-  RequestInfo() :  retry_count(0), completed(false){}
+  RequestInfo() : retry_count(0), completed(false), time_out(false) {}
 
   RequestInfo(RequestInfo &&other) noexcept
       : start_time(other.start_time),
         retry_count(other.retry_count.load(std::memory_order_relaxed)),
-        completed(other.completed.load(std::memory_order_relaxed)) {
+        completed(other.completed.load(std::memory_order_relaxed)),
+        time_out(other.time_out.load(std::memory_order_relaxed)) {
     other.start_time = 0;
 
     other.retry_count.store(0, std::memory_order_relaxed);
     other.completed.store(false, std::memory_order_relaxed);
+    other.time_out.store(false, std::memory_order_relaxed);
   }
 
   RequestInfo &operator=(RequestInfo &&other) noexcept {
@@ -51,11 +56,13 @@ struct RequestInfo {
 
       retry_count.store(other.retry_count.load(std::memory_order_relaxed));
       completed.store(other.completed.load(std::memory_order_relaxed));
+      time_out.store(other.time_out.load(std::memory_order_relaxed));
 
       other.start_time = 0;
 
       other.retry_count.store(0, std::memory_order_relaxed);
       other.completed.store(false, std::memory_order_relaxed);
+      other.time_out.store(false, std::memory_order_relaxed);
     }
     return *this;
   }

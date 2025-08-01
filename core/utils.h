@@ -123,6 +123,34 @@ inline void monitor_mempool(struct rte_mempool *mp) {
           in_use, use_percent);
 }
 
+inline void PrintHexData(const void *data, size_t size) {
+  unsigned char *byte_data = (unsigned char *)data;
+  for (size_t i = 0; i < size; ++i) {
+    printf("%02x ", byte_data[i]);
+    if ((i + 1) % 16 == 0) {
+      printf("  ");
+      for (size_t j = i - 15; j <= i; ++j) {
+        printf("%c", (byte_data[j] >= 32 && byte_data[j] <= 126) ? byte_data[j]
+                                                                 : '.');
+      }
+      printf("\n");
+    }
+  }
+  if (size % 16 != 0) {
+    size_t remaining = size % 16;
+    for (size_t i = 0; i < (16 - remaining); ++i) {
+      printf("   ");
+    }
+    printf("  ");
+    for (size_t i = size - remaining; i < size; ++i) {
+      printf("%c",
+             (byte_data[i] >= 32 && byte_data[i] <= 126) ? byte_data[i] : '.');
+    }
+    printf("\n");
+  }
+  printf("\n");
+}
+
 }  // namespace utils
 
 #endif  // YCSB_C_UTILS_H_

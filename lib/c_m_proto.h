@@ -7,6 +7,8 @@
 #include <cstdint>
 #include <vector>
 
+
+
 #define ENCODE_COMBINED(dev_id, op)                                     \
   (((dev_id & 0xFF) << 8) | ((0x00 & 0x0F) << 4) | ((op & 0x03) << 2) | \
    (0x00 & 0x03))
@@ -123,6 +125,7 @@ struct AskPacket : public BaseHeader {
 
 constexpr uint16_t IPV4_HDR_LEN = sizeof(rte_ipv4_hdr);
 constexpr uint16_t C_M_HDR_LEN = sizeof(KVHeader);
+constexpr uint16_t KV_HEADER_OFFSET  = RTE_ETHER_HDR_LEN + IPV4_HDR_LEN;
 
 const uint16_t TOTAL_LEN = RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + C_M_HDR_LEN;
 template <typename T>
