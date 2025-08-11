@@ -237,11 +237,6 @@ void CacheMigrationDpdk::StartDpdk() {
 
   running = true;
 
-  // if (timeout_core_ == UINT_MAX)
-  //   rte_exit(EXIT_FAILURE,
-  //            "No dedicated timeout core assigned (timeout_core_ =
-  //            UINT_MAX)");
-
   std::cerr << "start DPDK.." << std::endl;
   LaunchThreads();
 
@@ -251,7 +246,7 @@ void CacheMigrationDpdk::StartDpdk() {
     // for (auto &core : rx_cores_)
     //   std::cerr << rte_eth_rx_queue_count(port_id_, core.second) << " | ";
     // std::cerr << std::endl;
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    rte_delay_us_sleep(1'000);
   }
   use_time_us = get_now_micros() - send_start_us;
   running = false;
@@ -442,7 +437,7 @@ inline int CacheMigrationDpdk::RunTimeoutMonitor(void *arg) {
           }
         }
       }
-      rte_delay_us(kSleepIntervalUs);
+      rte_delay_us_block(kSleepIntervalUs);
     }
   }
   return 0;
@@ -551,9 +546,8 @@ inline int CacheMigrationDpdk::TxMain(void *arg) {
       std::cerr << " send error " << std::endl;
     } else {
       tx_success_count += nb_tx;
-      rte_delay_us(20);
+      // rte_delay_us_block(1);
     }
-
     tx_drop_count += (1 - nb_tx);
   }
   std::cout << "TX thread [" << rte_lcore_id() << "] sent " << tx_success_count
