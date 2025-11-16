@@ -7,18 +7,23 @@
 #include <cstdint>
 #include <vector>
 
-#define ENCODE_COMBINED(dev_id, op)                                     \
-  (((dev_id & 0xFF) << 8) | ((0x00 & 0x0F) << 4) | ((op & 0x03) << 2) | \
-   (0x00 & 0x03))
+#define ENCODE_DEV_INFO(dev_id, dev_type) \
+  (((dev_id & 0x1F) << 5) | ((dev_type & 0x07) << 2))
+
+#define GET_DEV_ID(dev_info) static_cast<uint8_t>(((dev_info) >> 3) & 0x1F)
+#define GET_DEV_TYPE(dev_info) static_cast<uint8_t>((dev_info) & 0x07)
+
+#define ENCODE_COMBINED(is_req, op) \
+  (((is_req & 0x0F) << 4) | ((op & 0x03) << 2) | (0x00 & 0x03))
+
+#define GET_IS_REQ(combined) static_cast<uint8_t>(((combined) >> 4) & 0x0F)
+#define GET_OP(combined) static_cast<uint8_t>(((combined) >> 2) & 0x03)
+#define GET_HOT_QUERY(combined) static_cast<uint8_t>((combined) & 0x03)
+
 #define DECODE_IP(ip) \
   ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF
 
-#define GET_DEV_ID(combined) static_cast<uint8_t>((combined) & 0xFF)
-#define GET_IS_REQ(combined) static_cast<uint8_t>(((combined) >> 12) & 0x0F)
-#define GET_OP(combined) static_cast<uint8_t>(((combined) >> 10) & 0x03)
-#define GET_HOT_QUERY(combined) static_cast<uint8_t>(((combined) >> 8) & 0x03)
-
-#define IP_PROTOCOLS_NETCACHE 0x54
+#define UDP_PORT_KV 50000
 
 namespace c_m_proto {
 
@@ -39,22 +44,12 @@ constexpr uint8_t CACHE_REJECT = 2;
 constexpr uint8_t CACHE_REPLY = 3;
 constexpr uint8_t WRITE_MIRROR = 5;
 
-// migration_status
-constexpr uint8_t MIGRATION_NO = 0;
-constexpr uint8_t MIGRATION_PREPARING = 3;
-constexpr uint8_t MIGRATION_TRANSFERRING = 1;
-constexpr uint8_t MIGRATION_DONE = 2;
-constexpr uint8_t MIGRATION_NOT_ENOUGH = 5;
-
 #pragma pack(push, 1)
-struct BaseHeader {
-  uint32_t request_id = 0;
-};
 
-struct KVHeader : public BaseHeader {
-  uint16_t
-      combined;  // dev_id(8 bit) | is_req(4 bit) | op(2 bit) | hot_query(2 bit)
-  uint32_t count = 0;
+struct KVRequest {
+  uint8_t dev_info;  // DevID_t (5 bits) | DevType_t (3 bits)
+  uint32_t request_id = 0;
+  uint8_t combined;  // is_req(4 bit) | op(2 bit) | hot_query(2 bit)
   std::array<char, KEY_LENGTH> key{};
   std::array<char, VALUE_LENGTH> value1{};
   std::array<char, VALUE_LENGTH> value2{};
@@ -65,7 +60,7 @@ struct KVHeader : public BaseHeader {
 #pragma pack(pop)
 
 constexpr uint16_t IPV4_HDR_LEN = sizeof(rte_ipv4_hdr);
-constexpr uint16_t C_M_HDR_LEN = sizeof(KVHeader);
+constexpr uint16_t C_M_HDR_LEN = sizeof(KVRequest);
 constexpr uint16_t KV_HEADER_OFFSET = RTE_ETHER_HDR_LEN + IPV4_HDR_LEN;
 
 const uint16_t TOTAL_LEN = RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + C_M_HDR_LEN;
@@ -79,7 +74,9 @@ struct PacketTraits {
 };
 
 template <>
-struct PacketTraits<KVHeader> {
-  static constexpr uint8_t Protocol = IP_PROTOCOLS_NETCACHE;
+struct PacketTraits<KVRequest> {
+  static constexpr uint8_t Protocol = IPPROTO_UDP;
+  static constexpr uint16_t SrcPort = UDP_PORT_KV;
+  static constexpr uint16_t DstPort = UDP_PORT_KV;
 };
 }  // namespace c_m_proto
