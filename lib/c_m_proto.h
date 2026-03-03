@@ -60,23 +60,12 @@ struct KVRequest {
 #pragma pack(pop)
 
 constexpr uint16_t IPV4_HDR_LEN = sizeof(rte_ipv4_hdr);
-constexpr uint16_t C_M_HDR_LEN = sizeof(KVRequest);
-constexpr uint16_t KV_HEADER_OFFSET = RTE_ETHER_HDR_LEN + IPV4_HDR_LEN;
+constexpr uint16_t UDP_HDR_LEN = sizeof(rte_udp_hdr);
+constexpr uint16_t KV_HDR_LEN = sizeof(KVRequest);
+constexpr uint16_t KV_HEADER_OFFSET =
+    RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN;
 
-const uint16_t TOTAL_LEN = RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + C_M_HDR_LEN;
-template <typename T>
-struct PacketTraits;
+const uint16_t TOTAL_LEN =
+    RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN + KV_HDR_LEN;
 
-template <typename T>
-struct PacketTraits {
-  static_assert(sizeof(T) == 0,
-                "PacketTraits<T> is not specialized for this type");
-};
-
-template <>
-struct PacketTraits<KVRequest> {
-  static constexpr uint8_t Protocol = IPPROTO_UDP;
-  static constexpr uint16_t SrcPort = UDP_PORT_KV;
-  static constexpr uint16_t DstPort = UDP_PORT_KV;
-};
 }  // namespace c_m_proto

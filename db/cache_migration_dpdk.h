@@ -26,6 +26,7 @@
 #define REQ_SIZE 100'000'000
 
 #define RTE_LOGTYPE_CORE RTE_LOGTYPE_USER3
+#define RTE_LOGTYPE_PACKET RTE_LOGTYPE_USER4
 
 extern std::atomic<bool> running;
 
@@ -38,7 +39,7 @@ struct RequestInfo {
 
   RequestInfo() : retry_count(0), completed(false), time_out(false) {}
 
-  RequestInfo(RequestInfo &&other) noexcept
+  RequestInfo(RequestInfo&& other) noexcept
       : start_time(other.start_time),
         retry_count(other.retry_count.load(std::memory_order_relaxed)),
         completed(other.completed.load(std::memory_order_relaxed)),
@@ -50,7 +51,7 @@ struct RequestInfo {
     other.time_out.store(false, std::memory_order_relaxed);
   }
 
-  RequestInfo &operator=(RequestInfo &&other) noexcept {
+  RequestInfo& operator=(RequestInfo&& other) noexcept {
     if (this != &other) {
       start_time = other.start_time;
 
@@ -74,8 +75,8 @@ struct RequestInfo {
     completed.store(false, std::memory_order_relaxed);
   }
 
-  RequestInfo(const RequestInfo &) = delete;
-  RequestInfo &operator=(const RequestInfo &) = delete;
+  RequestInfo(const RequestInfo&) = delete;
+  RequestInfo& operator=(const RequestInfo&) = delete;
 };
 
 struct TxConf {
@@ -93,23 +94,23 @@ class CacheMigrationDpdk : public DB {
     uint64_t iops = 0;
   };
 
-  CacheMigrationDpdk(utils::Properties &props);
+  CacheMigrationDpdk(utils::Properties& props);
   ~CacheMigrationDpdk();
   void AllocateSpace(size_t total_ops, size_t req_size) override;
   void Init(const int thread_id) override;
   void Close() override;
   void StartDpdk();
-  int Read(const std::string &table, const std::string &key,
-           const std::vector<std::string> *fields,
-           std::vector<KVPair> &result) override;
-  int Insert(const std::string &table, const std::string &key,
-             std::vector<KVPair> &values) override;
-  int Update(const std::string &table, const std::string &key,
-             std::vector<KVPair> &values) override;
-  int Delete(const std::string &table, const std::string &key) override;
-  int Scan(const std::string &table, const std::string &key, int record_count,
-           const std::vector<std::string> *fields,
-           std::vector<std::vector<KVPair>> &result) override;
+  int Read(const std::string& table, const std::string& key,
+           const std::vector<std::string>* fields,
+           std::vector<KVPair>& result) override;
+  int Insert(const std::string& table, const std::string& key,
+             std::vector<KVPair>& values) override;
+  int Update(const std::string& table, const std::string& key,
+             std::vector<KVPair>& values) override;
+  int Delete(const std::string& table, const std::string& key) override;
+  int Scan(const std::string& table, const std::string& key, int record_count,
+           const std::vector<std::string>* fields,
+           std::vector<std::vector<KVPair>>& result) override;
 
   void PrintStats() override;
 
@@ -120,16 +121,16 @@ class CacheMigrationDpdk : public DB {
   std::vector<std::pair<uint, uint16_t>> rx_cores_;
   std::vector<TxConf> tx_cores_;
   size_t num_tx_cores_ = 0;
-  rte_mempool *tx_mbufpool_;
-  rte_mempool *rx_mbufpool_;
+  rte_mempool* tx_mbufpool_;
+  rte_mempool* rx_mbufpool_;
   uint8_t port_id_ = 0;
   rte_ether_addr s_eth_addr_;
   rte_ether_addr d_eth_addr_;
-  std::vector<std::pair<rte_be32_t, uint>> src_ips_;
+  std::vector<std::pair<rte_be32_t, uint16_t>> src_ips_;
   uint64_t src_ips_size_ = 0;
 
   static thread_local rte_be32_t src_ip_;
-  static thread_local uint dev_id_;
+  static thread_local uint16_t dev_id_;
 
   std::vector<KVPair> DEFAULT_VALUES = {{"field0", "read"},
                                         {"field1", "read"},
@@ -138,7 +139,7 @@ class CacheMigrationDpdk : public DB {
 
   struct RxArgs {
     uint16_t queue_id;
-    CacheMigrationDpdk *instance;
+    CacheMigrationDpdk* instance;
   };
 
   std::vector<std::unique_ptr<RxArgs>> rx_args_;
@@ -147,15 +148,15 @@ class CacheMigrationDpdk : public DB {
   inline void AssignCores();
   int PortInit(uint16_t port);
   inline void LaunchThreads();
-  rte_mbuf *BuildRequestPacket(const std::string &key, uint8_t op,
+  rte_mbuf* BuildRequestPacket(const std::string& key, uint8_t op,
                                uint32_t req_id,
-                               const std::vector<KVPair> &values);
+                               const std::vector<KVPair>& values);
 
-  static inline int RunTimeoutMonitor(void *arg);
+  static inline int RunTimeoutMonitor(void* arg);
   void DoRx(uint16_t queue_id);
 
-  static inline int RxMain(void *arg);
-  static inline int TxMain(void *arg);
+  static inline int RxMain(void* arg);
+  static inline int TxMain(void* arg);
 };
 }  // namespace ycsbc
 
