@@ -450,17 +450,29 @@ inline int CacheMigrationDpdk::RunTimeoutMonitor(void* arg) {
   return 0;
 }
 
+/**
+ * @brief 处理网络接收操作的函数
+ * @param queue_id 要处理的接收队列ID
+ *
+ * 该函数在指定的核心上运行，负责从网络接口接收数据包，
+ * 处理接收到的响应，并标记相应的请求为已完成状态。
+ */
 void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
+  // 获取当前核心ID
   uint lcore_id = rte_lcore_id();
 
+  // 检查核心ID是否有效
   if (lcore_id == RTE_MAX_LCORE || lcore_id == (unsigned)LCORE_ID_ANY) {
     printf("Invalid lcore_id = %u\n", lcore_id);
     return;
   }
-  if (rte_lcore_is_enabled(lcore_id) && lcore_id != rte_get_main_lcore()) {
-    uint16_t port = 0;
-    uint16_t nb_rx;
 
+  // 检查核心是否启用且不是主核心
+  if (rte_lcore_is_enabled(lcore_id) && lcore_id != rte_get_main_lcore()) {
+    uint16_t port = 0;  // 网络端口号
+    uint16_t nb_rx;     // 接收到的数据包数量
+
+    // 检查端口是否在远程NUMA节点上，可能影响性能
     if (rte_eth_dev_socket_id(port) >= 0 &&
         rte_eth_dev_socket_id(port) != (int)rte_socket_id())
       printf(
@@ -469,30 +481,41 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
           "not be optimal.\n",
           port);
 
+    // 记录核心正在轮询的队列信息
     RTE_LOG(NOTICE, CORE, "[RX] %u polling queue: %hu\n", lcore_id, queue_id);
 
+    // 用于存储接收到的数据包的缓冲区
     rte_mbuf* bufs[BURST_SIZE];
 
+    // 主循环：持续接收数据包直到系统停止运行
     while (running.load(std::memory_order_acquire)) {
+      // 从网络端口批量接收数据包
       nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
 
+      // 如果没有接收到数据包，继续轮询
       if (unlikely(nb_rx == 0)) {
         continue;
       } else {
+        // 更新完成的请求计数
         completed_count.fetch_add(nb_rx, std::memory_order_relaxed);
 
+        // 处理每个接收到的数据包
         for (uint16_t i = 0; i < nb_rx; i++) {
+          // 从数据包中提取KV请求头部
           KVRequest* kv_header =
               rte_pktmbuf_mtod_offset(bufs[i], KVRequest*, KV_HEADER_OFFSET);
 
+          // 标记对应的请求为已完成状态
           requests[rte_be_to_cpu_32(kv_header->request_id)].completed.exchange(
               true);
 
+          // 释放数据包内存
           rte_pktmbuf_free(bufs[i]);
         }
       }
     }
   } else {
+    // 跳过主核心，避免干扰主核心的工作
     printf("Skip main lcore %u\n", lcore_id);
   }
   return;
@@ -504,60 +527,111 @@ inline int CacheMigrationDpdk::RxMain(void* arg) {
   return 0;
 }
 
+/**
+ * @brief 处理网络发送操作的主函数
+ * @param arg 包含发送配置信息的参数
+ * @return 0 表示成功
+ *
+ * 该函数在指定的核心上运行，负责发送网络数据包，
+ * 处理发送结果，统计发送成功和失败的数量，
+ * 并在发送完成后启动超时监控。
+ */
 inline int CacheMigrationDpdk::TxMain(void* arg) {
+  // 解析参数，获取发送配置信息
   TxConf* ctx = static_cast<TxConf*>(arg);
 
-  uint64_t tx_success_count = 0;
-  uint64_t tx_drop_count = 0;
+  // 初始化发送统计计数器
+  uint64_t tx_success_count = 0;  // 成功发送的数据包数量
+  uint64_t tx_drop_count = 0;     // 丢弃的数据包数量
 
+  // 从配置中获取队列ID和请求处理范围
   uint16_t queue_id = ctx->queue_id;
-  size_t start = ctx->interval.first;
-  size_t end = ctx->interval.second;
+  size_t start = ctx->interval.first;  // 起始请求ID
+  size_t end = ctx->interval.second;   // 结束请求ID
 
+  // 获取数据包总数
   size_t total_packets_num = packets.size();
 
+  // 记录发送开始时间
   send_start_us = get_now_micros();
+
+  // 批量发送数据包
+  constexpr uint16_t BATCH_SIZE =
+      BURST_SIZE;  // 使用定义的BURST_SIZE作为批量大小
+  rte_mbuf* batch_packets[BATCH_SIZE];
+  size_t batch_index = 0;
+
+  // 遍历处理指定范围内的请求
   for (size_t request_id = start; request_id < end; ++request_id) {
+    // 设置请求开始时间
     requests[request_id].start_time = get_now_micros();
 
+    // 计算数据包索引（使用取模运算循环使用数据包）
     size_t packet_index = request_id % total_packets_num;
     if (packet_index >= packets.size()) {
       std::cerr << "Error: Attempt to access an out-of-bounds packet index: "
                 << packet_index << " limit: " << packets.size() << std::endl;
       continue;
     }
+
+    // 获取数据包并解析网络头部
     rte_mbuf* packet = packets[packet_index];
     rte_ether_hdr* eth_hdr = rte_pktmbuf_mtod(packet, rte_ether_hdr*);
     rte_ipv4_hdr* ip_hdr = reinterpret_cast<rte_ipv4_hdr*>(eth_hdr + 1);
 
+    // 解析KV请求头部
     KVRequest* kv_header = reinterpret_cast<KVRequest*>(ip_hdr + 1);
     if (unlikely(kv_header == nullptr)) {
       std::cerr << "Error: Invalid KVHeader pointer" << std::endl;
       continue;
     }
 
+    // 设置请求ID（转换为网络字节序）
     kv_header->request_id = rte_cpu_to_be_32(request_id);
 
+    // 获取操作类型（读或写）
     const uint8_t op = GET_OP(kv_header->combined);
 
+    // 更新操作类型统计
     (op == READ_REQUEST ? read_count : update_count)
         .fetch_add(1, std::memory_order_relaxed);
 
-    uint16_t nb_tx = rte_eth_tx_burst(0, queue_id, &packet, 1);
-    if (nb_tx < 1) {
-      requests[request_id].completed.store(true);
-      false_count.fetch_add(1, std::memory_order_relaxed);
-      std::cerr << " send error " << std::endl;
-    } else {
-      tx_success_count += nb_tx;
-      // rte_delay_us_block(1);
+    // 将数据包添加到批处理数组
+    batch_packets[batch_index++] = packet;
+
+    // 当批处理数组满或到达请求末尾时发送数据包
+    if (batch_index == BATCH_SIZE || request_id == end - 1) {
+      if (batch_index > 0) {
+        // 发送批量数据包
+        uint16_t nb_tx =
+            rte_eth_tx_burst(0, queue_id, batch_packets, batch_index);
+
+        // 更新统计信息
+        tx_success_count += nb_tx;
+        tx_drop_count += (batch_index - nb_tx);
+
+        // 处理发送失败的数据包
+        for (uint16_t i = nb_tx; i < batch_index; ++i) {
+          // 计算对应的请求ID
+          size_t failed_request_id = request_id - (batch_index - 1) + i;
+          if (failed_request_id >= start && failed_request_id < end) {
+            requests[failed_request_id].completed.store(true);
+            false_count.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+
+        // 重置批处理索引
+        batch_index = 0;
+      }
     }
-    tx_drop_count += (1 - nb_tx);
   }
+
+  // 打印发送统计信息
   std::cout << "TX thread [" << rte_lcore_id() << "] sent " << tx_success_count
             << " drop " << tx_drop_count << " requests (queue " << queue_id
             << ")" << std::endl;
 
+  // 启动超时监控
   RunTimeoutMonitor(arg);
   return 0;
 }
