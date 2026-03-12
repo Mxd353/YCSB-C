@@ -98,16 +98,15 @@ CacheMigrationDpdk::CacheMigrationDpdk(utils::Properties& props)
   std::string line;
   while (std::getline(client_file, line)) {
     std::string ip_str;
-    u_int dev_id;
+    uint16_t dev_id;
     std::istringstream iss(line);
     if (iss >> ip_str >> dev_id) {
-      src_ips_.emplace_back(inet_addr(ip_str.c_str()), dev_id);
+      dev_infos_.emplace_back(DevInfo{inet_addr(ip_str.c_str()), dev_id});
       std::cout << "Add ip: " << ip_str << " | dev_id: " << dev_id << "\n";
     } else {
       std::cerr << "Warning: Invalid line format: " << line << std::endl;
     }
   }
-  src_ips_size_ = static_cast<uint64_t>(src_ips_.size());
 
   uint16_t nb_ports = rte_eth_dev_count_avail();
   if (nb_ports < 1) {
@@ -213,9 +212,10 @@ void CacheMigrationDpdk::Init(const int thread_id) {
   if (initialized) return;
   thread_id_ = thread_id;
 
-  auto selected = src_ips_[rte_rand_max(src_ips_size_)];
-  src_ip_ = selected.first;
-  dev_id_ = selected.second;
+  auto selected =
+      dev_infos_[rte_rand_max(static_cast<uint64_t>(dev_infos_.size()))];
+  src_ip_ = selected.src_ip;
+  dev_id_ = selected.dev_id;
 
   initialized = true;
 }
@@ -243,17 +243,18 @@ void CacheMigrationDpdk::StartDpdk() {
   LaunchThreads();
 
   while (completed_count + timeout_count + false_count < total_request_count) {
-    // utils::monitor_mempool(tx_mbufpool_);
-    // utils::monitor_mempool(rx_mbufpool_);
-    // for (auto &core : rx_cores_)
-    //   std::cerr << rte_eth_rx_queue_count(port_id_, core.second) << " | ";
-    // std::cerr << std::endl;
     rte_delay_us_sleep(1'000);
   }
+
   use_time_us = get_now_micros() - send_start_us;
   running = false;
 
   std::cerr << "All requests completed or timed out." << std::endl;
+}
+
+size_t CalculateRXCores(size_t total) {
+  if (total <= 1) return 1;
+  return (total * 2) / 3;
 }
 
 inline void CacheMigrationDpdk::AssignCores() {
@@ -270,21 +271,25 @@ inline void CacheMigrationDpdk::AssignCores() {
              total_workers);
   }
 
-  rx_cores_.clear();
-  tx_cores_.clear();
-
-  size_t rx_count = (total_workers * 2) / 3;
+  size_t rx_count = CalculateRXCores(total_workers);
   size_t tx_count = total_workers - rx_count;
 
+  if (tx_count == 0 && total_workers > 1) {
+    rx_count--;
+    tx_count = 1;
+  }
+
+  rx_cores_.reserve(rx_count);
+  tx_cores_.reserve(tx_count);
+
   for (size_t i = 0; i < rx_count; ++i) {
-    rx_cores_.push_back(std::make_pair(workers[i], 0));
+    rx_cores_.emplace_back(RxConf{workers[i], 0});
   }
 
   for (size_t i = rx_count; i < rx_count + tx_count; ++i) {
-    tx_cores_.push_back(TxConf{workers[i]});
+    tx_cores_.emplace_back(TxConf{workers[i]});
   }
 
-  num_tx_cores_ = tx_cores_.size();
   printf("Assigned %zu RX cores, %zu TX cores\n", rx_cores_.size(),
          tx_cores_.size());
 }
@@ -355,7 +360,7 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
     retval = rte_eth_rx_queue_setup(
         port, q, nb_rxd, rte_eth_dev_socket_id(port), nullptr, rx_mbufpool_);
     if (retval < 0) rte_exit(EXIT_FAILURE, "Cannot setup RX queue\n");
-    rx_cores_[q].second = q;
+    rx_cores_[q].queue_id = q;
   }
 
   rte_eth_txconf txconf;
@@ -464,8 +469,7 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
           "not be optimal.\n",
           port);
 
-    // RTE_LOG(NOTICE, CORE, "[RX] %u polling queue: %hu\n", lcore_id,
-    // queue_id);
+    RTE_LOG(NOTICE, CORE, "[RX] %u polling queue: %hu\n", lcore_id, queue_id);
 
     rte_mbuf* bufs[BURST_SIZE];
 
@@ -476,8 +480,7 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
         continue;
       } else {
         completed_count.fetch_add(nb_rx, std::memory_order_relaxed);
-        // std::cerr << "Get " << nb_rx << " packet on queue " << queue_id <<
-        // std::endl;
+
         for (uint16_t i = 0; i < nb_rx; i++) {
           KVRequest* kv_header =
               rte_pktmbuf_mtod_offset(bufs[i], KVRequest*, KV_HEADER_OFFSET);
@@ -511,13 +514,13 @@ inline int CacheMigrationDpdk::TxMain(void* arg) {
   size_t start = ctx->interval.first;
   size_t end = ctx->interval.second;
 
-  size_t total_packets = packets.size();
+  size_t total_packets_num = packets.size();
 
   send_start_us = get_now_micros();
   for (size_t request_id = start; request_id < end; ++request_id) {
     requests[request_id].start_time = get_now_micros();
 
-    size_t packet_index = request_id % total_packets;
+    size_t packet_index = request_id % total_packets_num;
     if (packet_index >= packets.size()) {
       std::cerr << "Error: Attempt to access an out-of-bounds packet index: "
                 << packet_index << " limit: " << packets.size() << std::endl;
@@ -563,8 +566,8 @@ inline void CacheMigrationDpdk::LaunchThreads() {
   rx_args_.clear();
   for (auto& core : rx_cores_) {
     try {
-      uint core_id = core.first;
-      uint16_t queue_id = core.second;
+      uint core_id = core.lcore_id;
+      uint16_t queue_id = core.queue_id;
       auto args = std::make_unique<RxArgs>();
       args->instance = this;
       args->queue_id = queue_id;
@@ -584,11 +587,12 @@ inline void CacheMigrationDpdk::LaunchThreads() {
 
   tx_args_.clear();
   size_t total = requests.size();
-  size_t per_core = total / num_tx_cores_;
-  size_t remainder = total % num_tx_cores_;
+  size_t num_tx_cores = tx_cores_.size();
+  size_t per_core = total / num_tx_cores;
+  size_t remainder = total % num_tx_cores;
 
   size_t offset = 0;
-  for (size_t i = 0; i < num_tx_cores_; ++i) {
+  for (size_t i = 0; i < num_tx_cores; ++i) {
     uint lcore_id = tx_cores_[i].lcore_id;
     uint16_t queue_id = tx_cores_[i].queue_id;
 
@@ -613,7 +617,7 @@ inline void CacheMigrationDpdk::LaunchThreads() {
 rte_mbuf* CacheMigrationDpdk::BuildRequestPacket(
     const std::string& key, uint8_t op, uint32_t req_id,
     const std::vector<KVPair>& values) {
-  if (src_ips_.empty()) {
+  if (dev_infos_.empty()) {
     RTE_LOG(ERR, PACKET, "No source IP available for packet construction\n");
     return nullptr;
   }
@@ -623,9 +627,9 @@ rte_mbuf* CacheMigrationDpdk::BuildRequestPacket(
     RTE_LOG(WARNING, PACKET,
             "BuildRequestPacket called with empty values vector\n");
   }
-  auto selected = src_ips_[0];
-  rte_be32_t src_ip = selected.first;
-  uint16_t dev_id = static_cast<uint16_t>(selected.second);
+  auto selected = dev_infos_[0];
+  rte_be32_t src_ip = selected.src_ip;
+  uint16_t dev_id = selected.dev_id;
 
   rte_mbuf* mbuf = rte_pktmbuf_alloc(tx_mbufpool_);
   if (!mbuf) return nullptr;
@@ -727,7 +731,6 @@ int CacheMigrationDpdk::Delete(const std::string& table,
 }
 
 void CacheMigrationDpdk::PrintStats() {
-  // utils::RequestIDGenerator::reset();
   uint64_t total_request = total_request_count.load(std::memory_order_relaxed);
   uint64_t completed = completed_count.load(std::memory_order_relaxed);
   completed = completed <= total_request_count ? completed : total_request;

@@ -85,6 +85,11 @@ struct TxConf {
   std::pair<size_t, size_t> interval{0, 0};
 };
 
+struct RxConf {
+  uint lcore_id;
+  uint16_t queue_id = 0;
+};
+
 namespace ycsbc {
 class CacheMigrationDpdk : public DB {
  public:
@@ -118,16 +123,11 @@ class CacheMigrationDpdk : public DB {
   const int num_threads_;
   static thread_local int thread_id_;
   ConsistentHash consistent_hash_;
-  std::vector<std::pair<uint, uint16_t>> rx_cores_;
-  std::vector<TxConf> tx_cores_;
-  size_t num_tx_cores_ = 0;
   rte_mempool* tx_mbufpool_;
   rte_mempool* rx_mbufpool_;
   uint8_t port_id_ = 0;
   rte_ether_addr s_eth_addr_;
   rte_ether_addr d_eth_addr_;
-  std::vector<std::pair<rte_be32_t, uint16_t>> src_ips_;
-  uint64_t src_ips_size_ = 0;
 
   static thread_local rte_be32_t src_ip_;
   static thread_local uint16_t dev_id_;
@@ -137,6 +137,9 @@ class CacheMigrationDpdk : public DB {
                                         {"field2", "read"},
                                         {"field3", "read"}};
 
+  std::vector<TxConf> tx_cores_;
+  std::vector<RxConf> rx_cores_;
+
   struct RxArgs {
     uint16_t queue_id;
     CacheMigrationDpdk* instance;
@@ -144,6 +147,13 @@ class CacheMigrationDpdk : public DB {
 
   std::vector<std::unique_ptr<RxArgs>> rx_args_;
   std::vector<std::unique_ptr<TxConf>> tx_args_;
+
+  struct DevInfo {
+    rte_be32_t src_ip;
+    uint16_t dev_id;
+  };
+
+  std::vector<DevInfo> dev_infos_;
 
   inline void AssignCores();
   int PortInit(uint16_t port);
