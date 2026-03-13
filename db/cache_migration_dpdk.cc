@@ -385,46 +385,76 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
   return 0;
 }
 
+/**
+ * @brief 超时监控函数，负责检查请求是否超时并处理超时请求
+ * @param arg 包含发送配置信息的参数
+ * @return 0 表示正常退出
+ *
+ * 该函数在指定的核心上运行，持续监控指定范围内的请求，
+ * 检查是否有请求超时，并对超时的请求进行重试或标记为失败。
+ * 实现了指数退避的超时重试机制。
+ */
 inline int CacheMigrationDpdk::RunTimeoutMonitor(void* arg) {
+  // 解析参数，获取发送配置信息
   TxConf* ctx = static_cast<TxConf*>(arg);
-  uint16_t queue_id = ctx->queue_id;
-  size_t start = ctx->interval.first;
-  size_t end = ctx->interval.second;
+  uint16_t queue_id = ctx->queue_id;   // 获取队列ID
+  size_t start = ctx->interval.first;  // 起始请求ID
+  size_t end = ctx->interval.second;   // 结束请求ID
 
+  // 定义睡眠间隔时间（微秒）
   constexpr uint64_t kSleepIntervalUs = 1000;
+  // 最大重试次数限制
   const uint16_t kMaxRetries = RETRIES;
+  // 批处理大小，将请求分批处理以提高效率
   size_t kBatchSize = (end - start) / 10;
 
+  // 获取数据包总数
   size_t total_packets = packets.size();
 
+  // 可选调试输出
   // std::cerr << "Start Timeout Monitor on lcore: " << rte_lcore_id()
   //           << std::endl;
 
+  // 主循环：持续监控直到系统停止运行
   while (running.load(std::memory_order_acquire)) {
+    // 将请求范围分批处理，避免单次处理过多请求
     for (size_t i = start; i < end; i += kBatchSize) {
+      // 计算当前批次的结束位置
       size_t batch_end = std::min(i + kBatchSize, end);
+      // 获取当前时间戳
       uint64_t now = get_now_micros();
 
+      // 遍历当前批次中的每个请求
       for (size_t request_id = i; request_id < batch_end; ++request_id) {
+        // 获取请求信息的引用
         RequestInfo& req = requests[request_id];
 
+        // 跳过已完成或已超时的请求
         if (req.completed.load() || req.time_out.load()) continue;
 
+        // 计算已用时间
         uint64_t elapsed_time =
             (now >= req.start_time) ? (now - req.start_time) : 0;
 
+        // 获取当前重试次数
         int current_retry_count =
             req.retry_count.load(std::memory_order_acquire);
 
+        // 计算预期超时时间（根据重试次数动态调整）
         uint64_t expected_timeout = time_out_us(current_retry_count);
+        // 如果未超时，跳过此请求
         if (elapsed_time < expected_timeout) continue;
 
+        // 检查是否超过最大重试次数
         if (current_retry_count > kMaxRetries) {
+          // 原子操作标记请求为超时状态
           if (req.time_out.exchange(true)) continue;
+          // 更新超时计数
           timeout_count.fetch_add(1, std::memory_order_relaxed);
           continue;
         }
 
+        // 计算数据包索引（使用取模运算循环使用数据包）
         size_t packet_index = request_id % total_packets;
         if (packet_index >= packets.size()) {
           std::cerr
@@ -432,18 +462,25 @@ inline int CacheMigrationDpdk::RunTimeoutMonitor(void* arg) {
               << packet_index << " limit: " << packets.size() << std::endl;
           continue;
         }
+        // 获取要重发的数据包
         rte_mbuf* packet = packets[packet_index];
 
+        // 检查数据包有效性并尝试重新发送
         if (packet && !req.completed.load()) {
+          // 发送数据包
           int sent = rte_eth_tx_burst(0, queue_id, &packet, 1);
           if (sent == 1) {
+            // 重发成功，更新统计信息
             // std::cerr << "Time out send" << std::endl;
-            timeout_send.fetch_add(1, std::memory_order_relaxed);
-            req.retry_count.fetch_add(1, std::memory_order_relaxed);
-            req.start_time = now;
+            timeout_send.fetch_add(1,
+                                   std::memory_order_relaxed);  // 增加重发计数
+            req.retry_count.fetch_add(
+                1, std::memory_order_relaxed);  // 增加重试次数
+            req.start_time = now;               // 重置开始时间为当前时间
           }
         }
       }
+      // 每处理完一批次后短暂休眠，避免过度占用CPU
       rte_delay_us_block(kSleepIntervalUs);
     }
   }
