@@ -8,7 +8,7 @@
 #include <vector>
 
 #define ENCODE_DEV_INFO(dev_id, dev_type) \
-  (((dev_id & 0x1F) << 5) | ((dev_type & 0x07) << 2))
+  (((dev_id & 0x1F) << 3) | (dev_type & 0x07))
 
 #define GET_DEV_ID(dev_info) static_cast<uint8_t>(((dev_info) >> 3) & 0x1F)
 #define GET_DEV_TYPE(dev_info) static_cast<uint8_t>((dev_info) & 0x07)
@@ -24,6 +24,11 @@
   ip & 0xFF, (ip >> 8) & 0xFF, (ip >> 16) & 0xFF, (ip >> 24) & 0xFF
 
 #define UDP_PORT_KV 50000
+
+#define DEV_SPINE 0
+#define DEV_LEAF 1
+#define DEV_CLIENT 2
+#define DEV_UNKNOWN 3
 
 namespace c_m_proto {
 

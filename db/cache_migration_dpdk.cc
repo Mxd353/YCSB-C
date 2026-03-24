@@ -773,18 +773,20 @@ rte_mbuf* CacheMigrationDpdk::BuildRequestPacket(
   rte_udp_hdr* udp_hdr = reinterpret_cast<rte_udp_hdr*>(ip_hdr + 1);
   udp_hdr->src_port = rte_cpu_to_be_16(UDP_PORT_KV);
   udp_hdr->dst_port = rte_cpu_to_be_16(UDP_PORT_KV);
-  udp_hdr->dgram_len = rte_cpu_to_be_16(TOTAL_LEN);
+  udp_hdr->dgram_len = rte_cpu_to_be_16(UDP_HDR_LEN + KV_HDR_LEN);
   udp_hdr->dgram_cksum = 0;
 
-  KVRequest* kv_header = reinterpret_cast<KVRequest*>(udp_hdr + 1);
-  uint16_t combined = ENCODE_COMBINED(dev_id, op);
-  kv_header->request_id = rte_cpu_to_be_32(req_id);
-  kv_header->combined = rte_cpu_to_be_16(combined);
-  rte_memcpy(kv_header->key.data(), key.data(), KEY_LENGTH);
-  rte_memcpy(kv_header->value1.data(), values[0].second.data(), VALUE_LENGTH);
-  rte_memcpy(kv_header->value2.data(), values[1].second.data(), VALUE_LENGTH);
-  rte_memcpy(kv_header->value3.data(), values[2].second.data(), VALUE_LENGTH);
-  rte_memcpy(kv_header->value4.data(), values[3].second.data(), VALUE_LENGTH);
+  KVRequest* kv_request = reinterpret_cast<KVRequest*>(udp_hdr + 1);
+  kv_request->dev_info =
+      static_cast<uint8_t>(ENCODE_DEV_INFO(dev_id, DEV_CLIENT));
+  kv_request->request_id = rte_cpu_to_be_32(req_id);
+  kv_request->combined =
+      static_cast<uint8_t>(ENCODE_COMBINED(CLIENT_REQUEST, op));
+  rte_memcpy(kv_request->key.data(), key.data(), KEY_LENGTH);
+  rte_memcpy(kv_request->value1.data(), values[0].second.data(), VALUE_LENGTH);
+  rte_memcpy(kv_request->value2.data(), values[1].second.data(), VALUE_LENGTH);
+  rte_memcpy(kv_request->value3.data(), values[2].second.data(), VALUE_LENGTH);
+  rte_memcpy(kv_request->value4.data(), values[3].second.data(), VALUE_LENGTH);
   return mbuf;
 }
 
