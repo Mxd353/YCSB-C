@@ -311,10 +311,10 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
   struct rte_eth_rxmode tmp_rxmode;
   memset(&tmp_rxmode, 0, sizeof(rte_eth_rxmode));
   tmp_rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
-  tmp_rxmode.mtu = TX_MBUF_DATA_SIZE;
+  tmp_rxmode.mtu = RX_MBUF_DATA_SIZE;
 
   rte_eth_rss_conf rss_conf;
-  rss_conf.rss_hf = RTE_ETH_RSS_IP;
+  rss_conf.rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP;
   rss_conf.rss_key_len = 40;
   rss_conf.rss_key = NULL;
 
@@ -335,6 +335,14 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
   if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_RSS_HASH)
     port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_RSS_HASH;
 
+  if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_CKSUM)
+    port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
+
+  // 确保关闭
+  // MBUF_FAST_FREE，因为我们需要在发送后修改数据包（如重发时更新request_id）
+  if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
+    port_conf.txmode.offloads &= ~RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+
   port_conf.rx_adv_conf.rss_conf.rss_hf &= dev_info.flow_type_rss_offloads;
   if (port_conf.rx_adv_conf.rss_conf.rss_hf !=
       port_conf_default.rx_adv_conf.rss_conf.rss_hf) {
@@ -345,10 +353,6 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
             port_conf.rx_adv_conf.rss_conf.rss_hf);
   }
 
-  uint16_t max_supported_tx_queues = dev_info.max_tx_queues;
-  RTE_LOG(NOTICE, EAL, "max_supported_tx_queues: %u\n",
-          max_supported_tx_queues);
-
   retval = rte_eth_dev_configure(port, nb_rx_cores, nb_tx_cores, &port_conf);
   if (retval != 0) rte_exit(EXIT_FAILURE, "Cannot configure port\n");
 
@@ -356,15 +360,23 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
   if (retval != 0) rte_exit(EXIT_FAILURE, "Cannot adjust desc number\n");
   RTE_LOG(NOTICE, EAL, "Adjusted nb_rxd = %u, nb_txd = %u\n", nb_rxd, nb_txd);
 
+  struct rte_eth_rxconf rxconf = dev_info.default_rxconf;
+  rxconf.offloads = port_conf.rxmode.offloads;
+
   for (uint16_t q = 0; q < nb_rx_cores; ++q) {
     retval = rte_eth_rx_queue_setup(
-        port, q, nb_rxd, rte_eth_dev_socket_id(port), nullptr, rx_mbufpool_);
+        port, q, nb_rxd, rte_eth_dev_socket_id(port), &rxconf, rx_mbufpool_);
     if (retval < 0) rte_exit(EXIT_FAILURE, "Cannot setup RX queue\n");
     rx_cores_[q].queue_id = q;
   }
 
-  rte_eth_txconf txconf;
-  memset(&txconf, 0, sizeof(txconf));
+  uint16_t max_supported_tx_queues = dev_info.max_tx_queues;
+  RTE_LOG(NOTICE, EAL, "max_supported_tx_queues: %u\n",
+          max_supported_tx_queues);
+
+  rte_eth_txconf txconf = dev_info.default_txconf;
+  txconf.offloads = port_conf.txmode.offloads;
+
   for (uint16_t q = 0; q < nb_tx_cores; ++q) {
     retval = rte_eth_tx_queue_setup(port, q, nb_txd,
                                     rte_eth_dev_socket_id(port), &txconf);
@@ -613,11 +625,10 @@ inline int CacheMigrationDpdk::TxMain(void* arg) {
 
     // 获取数据包并解析网络头部
     rte_mbuf* packet = packets[packet_index];
-    rte_ether_hdr* eth_hdr = rte_pktmbuf_mtod(packet, rte_ether_hdr*);
-    rte_ipv4_hdr* ip_hdr = reinterpret_cast<rte_ipv4_hdr*>(eth_hdr + 1);
 
     // 解析KV请求头部
-    KVRequest* kv_header = reinterpret_cast<KVRequest*>(ip_hdr + 1);
+    auto* kv_header =
+        rte_pktmbuf_mtod_offset(packet, KVRequest*, KV_HEADER_OFFSET);
     if (unlikely(kv_header == nullptr)) {
       std::cerr << "Error: Invalid KVHeader pointer" << std::endl;
       continue;
@@ -774,7 +785,7 @@ rte_mbuf* CacheMigrationDpdk::BuildRequestPacket(
   udp_hdr->src_port = rte_cpu_to_be_16(UDP_PORT_KV);
   udp_hdr->dst_port = rte_cpu_to_be_16(UDP_PORT_KV);
   udp_hdr->dgram_len = rte_cpu_to_be_16(UDP_HDR_LEN + KV_HDR_LEN);
-  udp_hdr->dgram_cksum = 0;
+  udp_hdr->dgram_cksum = rte_ipv4_udptcp_cksum(ip_hdr, udp_hdr);
 
   KVRequest* kv_request = reinterpret_cast<KVRequest*>(udp_hdr + 1);
   kv_request->dev_info =

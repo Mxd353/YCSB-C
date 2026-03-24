@@ -25,17 +25,18 @@
 
 #define UDP_PORT_KV 50000
 
-#define DEV_SPINE 0
-#define DEV_LEAF 1
-#define DEV_CLIENT 2
-#define DEV_UNKNOWN 3
-
 namespace c_m_proto {
 
 constexpr size_t KEY_LENGTH = 16;
 constexpr size_t VALUE_LENGTH = 4;
 
 constexpr uint16_t RETRIES = 5;
+
+// DevType
+constexpr uint8_t DEV_SPINE = 0;
+constexpr uint8_t DEV_LEAF = 1;
+constexpr uint8_t DEV_CLIENT = 2;
+constexpr uint8_t DEV_UNKNOWN = 3;
 
 // op
 constexpr uint8_t READ_REQUEST = 0;
@@ -51,9 +52,9 @@ constexpr uint8_t CACHE_REPLY = 3;
 #pragma pack(push, 1)
 
 struct KVRequest {
-  uint8_t dev_info;  // DevID_t (5 bits) | DevType_t (3 bits)
+  uint8_t dev_info;  // DevID (5 bits) | DevType (3 bits)
   uint32_t request_id = 0;
-  uint8_t combined;  // is_req(4 bit) | op(2 bit) | hot_query(2 bit)
+  uint8_t combined;  // is_req (4 bit) | op (2 bit) | hot_query (2 bit)
   std::array<char, KEY_LENGTH> key{};
   std::array<char, VALUE_LENGTH> value1{};
   std::array<char, VALUE_LENGTH> value2{};
@@ -66,10 +67,10 @@ struct KVRequest {
 constexpr uint16_t IPV4_HDR_LEN = sizeof(rte_ipv4_hdr);
 constexpr uint16_t UDP_HDR_LEN = sizeof(rte_udp_hdr);
 constexpr uint16_t KV_HDR_LEN = sizeof(KVRequest);
-constexpr uint16_t KV_HEADER_OFFSET =
-    RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN;
-
 const uint16_t TOTAL_LEN =
     RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN + KV_HDR_LEN;
+
+constexpr uint16_t KV_HEADER_OFFSET =
+    RTE_ETHER_HDR_LEN + IPV4_HDR_LEN + UDP_HDR_LEN;
 
 }  // namespace c_m_proto
