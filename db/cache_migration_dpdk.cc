@@ -15,6 +15,7 @@
 #include "core/utils.h"
 
 using namespace c_m_proto;
+using namespace utils;
 
 extern char* __progname;
 
@@ -282,11 +283,11 @@ inline void CacheMigrationDpdk::AssignCores() {
   rx_cores_.reserve(rx_count);
   tx_cores_.reserve(tx_count);
 
-  for (size_t i = 0; i < rx_count; ++i) {
+  for (auto i : range(rx_count)) {
     rx_cores_.emplace_back(RxConf{workers[i], 0});
   }
 
-  for (size_t i = rx_count; i < rx_count + tx_count; ++i) {
+  for (auto i : range(rx_count, rx_count + tx_count)) {
     tx_cores_.emplace_back(TxConf{workers[i]});
   }
 
@@ -363,7 +364,7 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
   struct rte_eth_rxconf rxconf = dev_info.default_rxconf;
   rxconf.offloads = port_conf.rxmode.offloads;
 
-  for (uint16_t q = 0; q < nb_rx_cores; ++q) {
+  for (auto q : range(nb_rx_cores)) {
     retval = rte_eth_rx_queue_setup(
         port, q, nb_rxd, rte_eth_dev_socket_id(port), &rxconf, rx_mbufpool_);
     if (retval < 0) rte_exit(EXIT_FAILURE, "Cannot setup RX queue\n");
@@ -377,7 +378,7 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
   rte_eth_txconf txconf = dev_info.default_txconf;
   txconf.offloads = port_conf.txmode.offloads;
 
-  for (uint16_t q = 0; q < nb_tx_cores; ++q) {
+  for (auto q : range(nb_tx_cores)) {
     retval = rte_eth_tx_queue_setup(port, q, nb_txd,
                                     rte_eth_dev_socket_id(port), &txconf);
     if (retval < 0) rte_exit(EXIT_FAILURE, "Cannot setup TX queue\n");
@@ -430,14 +431,14 @@ inline int CacheMigrationDpdk::RunTimeoutMonitor(void* arg) {
   // 主循环：持续监控直到系统停止运行
   while (running.load(std::memory_order_acquire)) {
     // 将请求范围分批处理，避免单次处理过多请求
-    for (size_t i = start; i < end; i += kBatchSize) {
+    for (auto i : range(start, end, kBatchSize)) {
       // 计算当前批次的结束位置
       size_t batch_end = std::min(i + kBatchSize, end);
       // 获取当前时间戳
       uint64_t now = get_now_micros();
 
       // 遍历当前批次中的每个请求
-      for (size_t request_id = i; request_id < batch_end; ++request_id) {
+      for (auto request_id : range(i, batch_end)) {
         // 获取请求信息的引用
         RequestInfo& req = requests[request_id];
 
@@ -549,7 +550,7 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
         completed_count.fetch_add(nb_rx, std::memory_order_relaxed);
 
         // 处理每个接收到的数据包
-        for (uint16_t i = 0; i < nb_rx; i++) {
+        for (auto i : range(nb_rx)) {
           // 从数据包中提取KV请求头部
           KVRequest* kv_header =
               rte_pktmbuf_mtod_offset(bufs[i], KVRequest*, KV_HEADER_OFFSET);
@@ -611,7 +612,7 @@ inline int CacheMigrationDpdk::TxMain(void* arg) {
   size_t batch_index = 0;
 
   // 遍历处理指定范围内的请求
-  for (size_t request_id = start; request_id < end; ++request_id) {
+  for (auto request_id : range(start, end)) {
     // 设置请求开始时间
     requests[request_id].start_time = get_now_micros();
 
@@ -659,7 +660,7 @@ inline int CacheMigrationDpdk::TxMain(void* arg) {
         tx_drop_count += (batch_index - nb_tx);
 
         // 处理发送失败的数据包
-        for (uint16_t i = nb_tx; i < batch_index; ++i) {
+        for (auto i : range(nb_tx, batch_index)) {
           // 计算对应的请求ID
           size_t failed_request_id = request_id - (batch_index - 1) + i;
           if (failed_request_id >= start && failed_request_id < end) {
@@ -714,7 +715,7 @@ inline void CacheMigrationDpdk::LaunchThreads() {
   size_t remainder = total % num_tx_cores;
 
   size_t offset = 0;
-  for (size_t i = 0; i < num_tx_cores; ++i) {
+  for (auto i : range(num_tx_cores)) {
     uint lcore_id = tx_cores_[i].lcore_id;
     uint16_t queue_id = tx_cores_[i].queue_id;
 

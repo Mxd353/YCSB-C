@@ -26,7 +26,7 @@ void ConsistentHash::AddServer(const std::string &ip) {
 
   std::unique_lock lock(rw_mutex_);
   int added_nodes = 0;
-  for (int i = 0; i < virtual_node_count_; ++i) {
+  for (auto i : utils::range(virtual_node_count_)) {
     std::string virtualNode = ip + "#" + std::to_string(i);
     size_t hashValue = Hash(virtualNode);
     if (hash_to_server_.find(hashValue) == hash_to_server_.end()) {

@@ -45,7 +45,7 @@ int DelegateClient(ycsbc::DB *db, ycsbc::CoreWorkload *wl, const int num_ops,
   ycsbc::Client client(*db, *wl);
   int oks = 0;
 
-  for (int i = 0; i < num_ops; ++i) {
+  for (auto i : utils::range(num_ops)) {
     oks += is_loading ? client.DoInsert() : client.DoTransaction();
   }
 
@@ -80,14 +80,14 @@ int main(const int argc, const char *argv[]) {
     // Loads data
     total_ops = stoi(props[ycsbc::CoreWorkload::RECORD_COUNT_PROPERTY]);
     db->AllocateSpace(total_ops, total_ops);
-    
+
     int threads_to_launch = std::min(num_threads, total_ops);
     int ops_per_thread = total_ops / threads_to_launch;
     int remaining_ops = total_ops % threads_to_launch;
 
     fprintf(stderr, "Do load use %d threads...\n", threads_to_launch);
 
-    for (int i = 0; i < threads_to_launch; ++i) {
+    for (auto i : utils::range(threads_to_launch)) {
       int ops_to_process = ops_per_thread + (i < remaining_ops ? 1 : 0);
       actual_ops.emplace_back(async(launch::async, DelegateClient, db, &wl,
                                     ops_to_process, i, true));
@@ -134,7 +134,7 @@ int main(const int argc, const char *argv[]) {
   }
 
   // Peforms transactions
-  for (int j = 0; j < ycsbc::Operation::READMODIFYWRITE + 1; j++) {
+  for (auto j : utils::range(ycsbc::Operation::READMODIFYWRITE + 1)) {
     ops_cnt[j].store(0);
     ops_time[j].store(0);
   }
@@ -148,7 +148,7 @@ int main(const int argc, const char *argv[]) {
   fprintf(stderr, "Do run use %d threads...\n", threads_to_launch);
   timer.Start();
 
-  for (int i = 0; i < threads_to_launch; ++i) {
+  for (auto i : utils::range(threads_to_launch)) {
     actual_ops.emplace_back(async(launch::async, DelegateClient, db, &wl,
                                   ops_per_thread, i, false));
   }
