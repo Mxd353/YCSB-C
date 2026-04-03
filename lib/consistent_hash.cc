@@ -26,7 +26,7 @@ void ConsistentHash::AddServer(const std::string &ip) {
 
   std::unique_lock lock(rw_mutex_);
   int added_nodes = 0;
-  for (int i = 0; i < virtual_node_count_; ++i) {
+  for (auto i : utils::range(virtual_node_count_)) {
     std::string virtualNode = ip + "#" + std::to_string(i);
     size_t hashValue = Hash(virtualNode);
     if (hash_to_server_.find(hashValue) == hash_to_server_.end()) {
@@ -80,8 +80,8 @@ ConsistentHash::ConsistentHash(const std::string &server_ip_file,
             << "\n========================================\n";
 }
 
-void ConsistentHash::MigrateKey(const std::array<char, KEY_LENGTH> &key,
-                                rte_be32_t newServer) {
+void ConsistentHash::MigrateKey(
+    const std::array<char, c_m_proto::KEY_LENGTH> &key, rte_be32_t newServer) {
   std::string key_str(key.begin(), key.end());
   std::string oldip_str;
   utils::ReverseRTE_IPV4(uint32_t(FindServer(key_str)), oldip_str);

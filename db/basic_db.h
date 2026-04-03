@@ -24,9 +24,9 @@ namespace ycsbc {
 
 class BasicDB : public DB {
  public:
-  void Init() {
+  void Init(const int thread_id) {
     std::lock_guard<std::mutex> lock(mutex_);
-    cout << "A new thread begins working." << endl;
+    cout << "A new thread " << thread_id << " begins working. \n" << endl;
   }
 
   int Read(const std::string &table, const std::string &key,

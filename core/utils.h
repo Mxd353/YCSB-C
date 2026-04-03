@@ -9,13 +9,92 @@
 #ifndef YCSB_C_UTILS_H_
 #define YCSB_C_UTILS_H_
 
+#include <rte_log.h>
+#include <rte_mbuf.h>
+
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <exception>
 #include <random>
+#include <stdexcept>
 
 namespace utils {
+
+template <typename T>
+class Range {
+ public:
+  class Iterator {
+   public:
+    using iterator_category = std::input_iterator_tag;
+    using value_type = T;
+    using difference_type = std::ptrdiff_t;
+    using pointer = const T*;
+    using reference = const T&;
+
+    Iterator(T value, T stop, T step)
+        : value_(value), stop_(stop), step_(step) {}
+
+    T operator*() const { return value_; }
+
+    Iterator& operator++() {
+      value_ += step_;
+      return *this;
+    }
+
+    Iterator operator++(int) {
+      Iterator tmp = *this;
+      ++(*this);
+      return tmp;
+    }
+
+    bool operator==(const Iterator& other) const {
+      if (step_ > 0) {
+        return value_ >= other.value_;
+      } else {
+        return value_ <= other.value_;
+      }
+    }
+
+    bool operator!=(const Iterator& other) const { return !(*this == other); }
+
+   private:
+    T value_;
+    T stop_;
+    T step_;
+  };
+
+  Range(T stop) : start_(0), stop_(stop), step_(1) {
+    if (stop_ < 0) stop_ = 0;
+  }
+
+  Range(T start, T stop, T step = 1) : start_(start), stop_(stop), step_(step) {
+    if (step == 0) {
+      throw std::invalid_argument("step cannot be zero");
+    }
+  }
+
+  Iterator begin() const { return Iterator(start_, stop_, step_); }
+
+  Iterator end() const { return Iterator(stop_, stop_, step_); }
+
+ private:
+  T start_;
+  T stop_;
+  T step_;
+};
+
+template <typename T>
+Range<T> range(T stop) {
+  return Range<T>(stop);
+}
+
+template <typename T1, typename T2, typename T3 = T2>
+auto range(T1 start, T2 stop, T3 step = 1)
+    -> Range<std::common_type_t<T1, T2, T3>> {
+  using CommonType = std::common_type_t<T1, T2, T3>;
+  return Range<CommonType>(start, stop, step);
+}
 
 const uint64_t kFNVOffsetBasis64 = 0xCBF29CE484222325;
 const uint64_t kFNVPrime64 = 1099511628211;
@@ -48,8 +127,8 @@ inline char RandomPrintChar() { return rand() % 94 + 33; }
 
 class Exception : public std::exception {
  public:
-  Exception(const std::string &message) : message_(message) {}
-  const char *what() const noexcept { return message_.c_str(); }
+  Exception(const std::string& message) : message_(message) {}
+  const char* what() const noexcept { return message_.c_str(); }
 
  private:
   std::string message_;
@@ -66,7 +145,7 @@ inline bool StrToBool(std::string str) {
   }
 }
 
-inline std::string Trim(const std::string &str) {
+inline std::string Trim(const std::string& str) {
   auto front = std::find_if_not(str.begin(), str.end(),
                                 [](int c) { return std::isspace(c); });
   return std::string(
@@ -76,7 +155,7 @@ inline std::string Trim(const std::string &str) {
           .base());
 }
 
-inline void ReverseRTE_IPV4(uint32_t ip, std::string &result) {
+inline void ReverseRTE_IPV4(uint32_t ip, std::string& result) {
   uint8_t a = (ip >> 24) & 0xFF;
   uint8_t b = (ip >> 16) & 0xFF;
   uint8_t c = (ip >> 8) & 0xFF;
@@ -86,9 +165,66 @@ inline void ReverseRTE_IPV4(uint32_t ip, std::string &result) {
            std::to_string(b) + "." + std::to_string(a);
 }
 
-static inline uint32_t generate_request_id() {
+class RequestIDGenerator {
+ private:
+  static std::atomic<uint32_t> counter;
+
+ public:
+  static uint32_t next() {
+    return counter.fetch_add(1, std::memory_order_relaxed);
+  }
+
+  static void reset() { counter.store(0, std::memory_order_relaxed); }
+};
+
+static inline uint32_t global_request_id() {
   static std::atomic<uint32_t> counter{0};
   return counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+static inline uint32_t generate_request_id(uint32_t thread_id) {
+  constexpr uint32_t MAX_REQ_PER_THREAD = 10'000'000;
+
+  thread_local static uint32_t local_counter = 0;
+
+  return thread_id * MAX_REQ_PER_THREAD + local_counter++;
+}
+
+inline void monitor_mempool(struct rte_mempool* mp) {
+  unsigned avail = rte_mempool_avail_count(mp);
+  unsigned in_use = rte_mempool_in_use_count(mp);
+  double use_percent = (double)in_use * 100.0 / (double)mp->size;
+
+  RTE_LOG(NOTICE, MEMPOOL, "Status: Available=%u, In_use=%u (%.1f%%)\n", avail,
+          in_use, use_percent);
+}
+
+inline void PrintHexData(const void* data, size_t size) {
+  unsigned char* byte_data = (unsigned char*)data;
+  for (auto i : range(size)) {
+    printf("%02x ", byte_data[i]);
+    if ((i + 1) % 16 == 0) {
+      printf("  ");
+      for (auto j : range(i - 15, i + 1)) {
+        printf("%c", (byte_data[j] >= 32 && byte_data[j] <= 126) ? byte_data[j]
+                                                                 : '.');
+      }
+      printf("\n");
+    }
+  }
+  if (size % 16 != 0) {
+    size_t remaining = size % 16;
+    for (size_t i = 0; i < (16 - remaining); ++i) {
+      printf("   ");
+    }
+    printf("  ");
+    for (auto i : range(size - remaining, size)) {
+      printf("%c",
+             (byte_data[i] >= 32 && byte_data[i] <= 126) ? byte_data[i] : '.');
+    }
+    printf("\n");
+  }
+  printf("\n");
 }
 
 }  // namespace utils

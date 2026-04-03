@@ -1,38 +1,71 @@
 #include "cache_migration_dpdk.h"
 
+#include <algorithm>
 #include <bitset>
 #include <chrono>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <random>
 #include <sstream>
 #include <thread>
 
+#include "core/core_workload.h"
 #include "core/timer.h"
 #include "core/utils.h"
 
-extern char *__progname;
+using namespace c_m_proto;
+using namespace utils;
 
-static const std::string field_names[4] = {"field0", "field1", "field2",
-                                           "field3"};
+extern char* __progname;
+
+static std::vector<RequestInfo> requests;
+static std::vector<rte_mbuf*> packets;
+
+// std::atomic<uint32_t> utils::RequestIDGenerator::counter{0};
+
+uint64_t send_start_us = 0;
+uint64_t use_time_us = 0;
 std::atomic<bool> running{false};
 
-thread_local static int assigned_ring_id = -1;
-thread_local static rte_ring *assigned_ring = nullptr;
+std::atomic<uint64_t> total_latency_us{0};
+std::atomic<size_t> total_request_count{0};
+std::atomic<size_t> completed_count{0};
+std::atomic<size_t> timeout_count{0};
+std::atomic<size_t> timeout_send{0};
+std::atomic<size_t> false_count{0};
+
+std::atomic<size_t> read_count{0};
+// std::atomic<size_t> read_success{0};
+std::atomic<size_t> update_count{0};
+// std::atomic<size_t> update_success{0};
 
 static inline void exponentialBackoff(int attempt) {
   int wait_ms = std::min(20 * (1 << (attempt - 1)), 500);
   std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
 }
 
+static inline uint64_t time_out_us(int retry_count) {
+  constexpr uint64_t BASE_TIMEOUT_US = 20'000;
+  constexpr uint64_t MAX_TIMEOUT_US = 500'000;
+
+  if (retry_count <= 0) {
+    return BASE_TIMEOUT_US;
+  }
+
+  uint64_t exponential_backoff = BASE_TIMEOUT_US * (1ULL << (retry_count - 1));
+  return std::min(exponential_backoff, MAX_TIMEOUT_US);
+}
+
 namespace ycsbc {
 thread_local rte_be32_t CacheMigrationDpdk::src_ip_ = 0;
-thread_local uint CacheMigrationDpdk::dev_id_ = 0;
-
+thread_local uint16_t CacheMigrationDpdk::dev_id_ = 0;
+thread_local int CacheMigrationDpdk::thread_id_ = 0;
 thread_local CacheMigrationDpdk::ThreadStats thread_stats;
 
-CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
-    : num_threads_(num_threads), consistent_hash_("conf/server_ips.conf") {
+CacheMigrationDpdk::CacheMigrationDpdk(utils::Properties& props)
+    : num_threads_(std::stoi(props.GetProperty("threadcount", "1"))),
+      consistent_hash_("conf/server_ips.conf") {
   std::vector<std::string> args;
   std::string dpdk_conf = "conf/dpdk.conf";
   std::ifstream dpdk_file(dpdk_conf);
@@ -40,10 +73,7 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
   std::ifstream client_file(client_conf);
   std::string token;
 
-  all_thread_stats_.reserve(num_threads);
-
-  char *program_name = __progname;
-
+  char* program_name = __progname;
   args.push_back(program_name);
 
   // 动态核数
@@ -53,9 +83,9 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
   while (dpdk_file >> token) {
     args.push_back(token);
   }
-  std::vector<char *> argv;
-  for (auto &arg : args) {
-    argv.push_back(const_cast<char *>(arg.c_str()));
+  std::vector<char*> argv;
+  for (auto& arg : args) {
+    argv.push_back(const_cast<char*>(arg.c_str()));
   }
 
   int ret = rte_eal_init(argv.size(), argv.data());
@@ -69,16 +99,15 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
   std::string line;
   while (std::getline(client_file, line)) {
     std::string ip_str;
-    u_int dev_id;
+    uint16_t dev_id;
     std::istringstream iss(line);
     if (iss >> ip_str >> dev_id) {
-      src_ips_.emplace_back(inet_addr(ip_str.c_str()), dev_id);
+      dev_infos_.emplace_back(DevInfo{inet_addr(ip_str.c_str()), dev_id});
       std::cout << "Add ip: " << ip_str << " | dev_id: " << dev_id << "\n";
     } else {
       std::cerr << "Warning: Invalid line format: " << line << std::endl;
     }
   }
-  src_ips_size_ = static_cast<uint64_t>(src_ips_.size());
 
   uint16_t nb_ports = rte_eth_dev_count_avail();
   if (nb_ports < 1) {
@@ -87,22 +116,22 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
     return;
   }
 
-  tx_mbufpool_ = rte_pktmbuf_pool_create(
-      "TX_MBUF_POOL", NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE,
-      RTE_MBUF_PRIV_ALIGN, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+  uint32_t data_size = (uint32_t)TOTAL_LEN + sizeof(rte_mbuf);
+  data_size = 1 << (32 - __builtin_clz(data_size - 1));
+
+  tx_mbufpool_ =
+      rte_pktmbuf_pool_create("TX_MBUF_POOL", TX_NUM_MBUFS, MBUF_CACHE_SIZE, 0,
+                              data_size, rte_socket_id());
   if (tx_mbufpool_ == NULL)
     rte_exit(EXIT_FAILURE, "Cannot create TX_MBUF_POOL\n");
 
-  rx_mbufpool_ = rte_pktmbuf_pool_create(
-      "RX_MBUF_POOL", NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE,
-      RTE_MBUF_PRIV_ALIGN, RTE_MBUF_DEFAULT_BUF_SIZE, rte_socket_id());
+  rx_mbufpool_ =
+      rte_pktmbuf_pool_create("RX_MBUF_POOL", RX_NUM_MBUFS, MBUF_CACHE_SIZE, 0,
+                              RX_MBUF_DATA_SIZE, rte_socket_id());
   if (rx_mbufpool_ == NULL)
     rte_exit(EXIT_FAILURE, "Cannot create RX_MBUF_POOL\n");
 
   AssignCores();
-
-  rte_ether_unformat_addr("00:11:22:33:44:55", &s_eth_addr_);
-  rte_ether_unformat_addr("aa:bb:cc:dd:ee:ff", &d_eth_addr_);
 
   uint16_t port = 0;
   if (PortInit(port) != 0) {
@@ -111,9 +140,10 @@ CacheMigrationDpdk::CacheMigrationDpdk(int num_threads)
     rte_exit(EXIT_FAILURE, "Cannot init port %" PRIu16 "\n", port);
   }
 
+  rte_ether_unformat_addr("00:11:22:33:44:55", &s_eth_addr_);
+  rte_ether_unformat_addr("b8:3f:d2:08:ab:d2", &d_eth_addr_);
+
   std::cout << "+++++++++++++++++++++++++++++++++\n";
-  running = true;
-  LaunchThreads();
 }
 
 CacheMigrationDpdk::~CacheMigrationDpdk() {
@@ -124,15 +154,16 @@ CacheMigrationDpdk::~CacheMigrationDpdk() {
   rte_eth_dev_stop(port);
   rte_eth_dev_close(port);
 
-  for (auto &core : tx_cores_) {
-    for (auto &ring : core.rings) {
-      if (ring) {
-        rte_ring_free(ring);
-        ring = nullptr;
-      }
+  requests.clear();
+  for (auto pkt : packets) {
+    if (pkt == nullptr) {
+      continue;
     }
-    core.rings.clear();
+
+    rte_pktmbuf_free(pkt);
+    pkt = nullptr;
   }
+  packets.clear();
 
   if (tx_mbufpool_) {
     rte_mempool_free(tx_mbufpool_);
@@ -142,56 +173,126 @@ CacheMigrationDpdk::~CacheMigrationDpdk() {
     rte_mempool_free(rx_mbufpool_);
     rx_mbufpool_ = nullptr;
   }
-  request_map_.Clear();
 
   std::cout << "CacheMigrationDpdk resources cleaned up." << std::endl;
-};
+}
 
-void CacheMigrationDpdk::Init() {
+void CacheMigrationDpdk::AllocateSpace(size_t total_ops, size_t req_size) {
+  if (total_ops == 0) {
+    throw std::invalid_argument("total_ops must be greater than 0");
+  }
+
+  total_latency_us.store(0, std::memory_order_relaxed);
+  completed_count.store(0, std::memory_order_relaxed);
+  timeout_count.store(0, std::memory_order_relaxed);
+  timeout_send.store(0, std::memory_order_relaxed);
+  false_count.store(0, std::memory_order_relaxed);
+  total_request_count.store(req_size, std::memory_order_relaxed);
+
+  send_start_us = 0;
+  use_time_us = 0;
+
+  requests.clear();
+  requests.resize(req_size);
+
+  for (auto pkt : packets) {
+    if (pkt == nullptr) {
+      std::cerr << "Error: Attempt to free a null pointer" << std::endl;
+      continue;
+    }
+
+    rte_pktmbuf_free(pkt);
+    pkt = nullptr;
+  }
+  packets.clear();
+  packets.reserve(total_request_count);
+}
+
+void CacheMigrationDpdk::Init(const int thread_id) {
   static thread_local bool initialized = false;
   if (initialized) return;
+  thread_id_ = thread_id;
 
-  auto selected = src_ips_[rte_rand_max(src_ips_size_)];
-  src_ip_ = selected.first;
-  dev_id_ = selected.second;
-
-  auto t_id = std::this_thread::get_id();
-  std::hash<std::thread::id> hasher;
-
-  int tx_core_index = hasher(t_id) % tx_cores_.size();
-  TxConf &core_conf = tx_cores_[tx_core_index];
-
-  assigned_ring_id = hasher(t_id) % core_conf.rings.size();
-  assigned_ring = core_conf.rings[assigned_ring_id];
-
-  if (!assigned_ring) {
-    std::cerr << "Failed to get ring[" << assigned_ring_id << "] from TX core "
-              << tx_core_index << ": " << rte_strerror(rte_errno) << "\n";
-    return;
-  }
+  auto selected =
+      dev_infos_[rte_rand_max(static_cast<uint64_t>(dev_infos_.size()))];
+  src_ip_ = selected.src_ip;
+  dev_id_ = selected.dev_id;
 
   initialized = true;
 }
 
-void CacheMigrationDpdk::Close() {
-  {
-    std::lock_guard<std::mutex> lock(stats_mutex);
-    all_thread_stats_.push_back(thread_stats);
+void CacheMigrationDpdk::Close() {}
+
+void CacheMigrationDpdk::StartDpdk() {
+  for (auto& req : requests) {
+    if (req.completed.load(std::memory_order_acquire)) {
+      rte_exit(EXIT_FAILURE, "Have not completed!");
+    }
   }
+
+  for (auto pkt : packets) {
+    if (!pkt) {
+      rte_exit(EXIT_FAILURE, "Have mbuf is nullptr!");
+    }
+  }
+
+  std::cerr << "All " << requests.size() << " requests valid." << std::endl;
+
+  running = true;
+
+  std::cerr << "start DPDK.." << std::endl;
+  LaunchThreads();
+
+  while (completed_count + timeout_count + false_count < total_request_count) {
+    rte_delay_us_sleep(1'000);
+  }
+
+  use_time_us = get_now_micros() - send_start_us;
+  running = false;
+
+  std::cerr << "All requests completed or timed out." << std::endl;
+}
+
+size_t CalculateRXCores(size_t total) {
+  if (total <= 1) return 1;
+  return (total * 2) / 3;
 }
 
 inline void CacheMigrationDpdk::AssignCores() {
   uint lcore_id;
-  uint count = 0;
-  uint core_count = rte_lcore_count();
-  RTE_LCORE_FOREACH_WORKER(lcore_id) {
-    if (count++ < (core_count - 1) / 2) {
-      rx_cores_.push_back(std::make_pair(lcore_id, 0));
-    } else {
-      tx_cores_.push_back(TxConf{lcore_id});
-    }
+  std::vector<uint> workers;
+
+  RTE_LCORE_FOREACH_WORKER(lcore_id) { workers.push_back(lcore_id); }
+
+  size_t total_workers = workers.size();
+  if (total_workers < 3) {
+    rte_exit(EXIT_FAILURE,
+             "Need at least 3 worker cores (got %zu): RX, TX, and "
+             "TimeoutMonitorThread\n",
+             total_workers);
   }
-  num_tx_cores_ = tx_cores_.size();
+
+  size_t rx_count = CalculateRXCores(total_workers);
+  size_t tx_count = total_workers - rx_count;
+
+  if (tx_count == 0 && total_workers > 1) {
+    rx_count--;
+    tx_count = 1;
+  }
+
+  rx_cores_.reserve(rx_count);
+  tx_cores_.reserve(tx_count);
+
+  for (auto i : range(rx_count)) {
+    rx_cores_.emplace_back(RxConf{workers[i], 0});
+  }
+
+  for (auto i : range(rx_count, rx_count + tx_count)) {
+    tx_cores_.emplace_back(TxConf{workers[i]});
+  }
+
+  printf("Assigned %zu RX cores, %zu TX cores\n", rx_cores_.size(),
+         tx_cores_.size());
 }
 
 int CacheMigrationDpdk::PortInit(uint16_t port) {
@@ -201,164 +302,227 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
   uint16_t nb_rx_cores = rx_cores_.size();
   uint16_t nb_tx_cores = tx_cores_.size();
 
-  if (tx_mbufpool_ == NULL || rx_mbufpool_ == NULL) {
-    printf("mbuf_pool is NULL!\n");
-    return -1;
-  }
+  if (tx_mbufpool_ == NULL || rx_mbufpool_ == NULL)
+    rte_exit(EXIT_FAILURE, "mbuf_pool is NULL!\n");
 
-  struct rte_eth_conf port_conf;
   if (!rte_eth_dev_is_valid_port(port)) return -1;
-  memset(&port_conf, 0, sizeof(struct rte_eth_conf));
+
+  static struct rte_eth_conf port_conf_default;
+
+  struct rte_eth_rxmode tmp_rxmode;
+  memset(&tmp_rxmode, 0, sizeof(rte_eth_rxmode));
+  tmp_rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
+  tmp_rxmode.mtu = RX_MBUF_DATA_SIZE;
+
+  rte_eth_rss_conf rss_conf;
+  rss_conf.rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP;
+  rss_conf.rss_key_len = 40;
+  rss_conf.rss_key = NULL;
+
+  port_conf_default.rxmode = tmp_rxmode;
+  port_conf_default.rx_adv_conf.rss_conf = rss_conf;
+
+  rte_eth_conf port_conf = port_conf_default;
 
   int retval;
-  struct rte_eth_dev_info dev_info;
+  rte_eth_dev_info dev_info;
   retval = rte_eth_dev_info_get(port, &dev_info);
   if (retval != 0) {
-    std::cerr << "Error getting device info: " << rte_strerror(retval) << "\n";
+    RTE_LOG(ERR, EAL, "Error during getting device (port %u) info: %s\n", port,
+            strerror(-retval));
     return retval;
   }
 
-  if (dev_info.flow_type_rss_offloads & RTE_ETH_RSS_IP) {
-    port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
-    port_conf.rx_adv_conf.rss_conf.rss_key = nullptr;
-    port_conf.rx_adv_conf.rss_conf.rss_hf = RTE_ETH_RSS_IP;
-    printf("RSS enabled: RTE_ETH_RSS_IP\n");
-  } else {
-    port_conf.rxmode.mq_mode = RTE_ETH_MQ_RX_NONE;
-    printf("WARNING: RSS_IP not supported, falling back to single queue.\n");
-  }
+  if (dev_info.rx_offload_capa & RTE_ETH_RX_OFFLOAD_RSS_HASH)
+    port_conf.rxmode.offloads |= RTE_ETH_RX_OFFLOAD_RSS_HASH;
 
+  if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_CKSUM)
+    port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
+
+  // 确保关闭
+  // MBUF_FAST_FREE，因为我们需要在发送后修改数据包（如重发时更新request_id）
   if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
-    port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+    port_conf.txmode.offloads &= ~RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+
+  port_conf.rx_adv_conf.rss_conf.rss_hf &= dev_info.flow_type_rss_offloads;
+  if (port_conf.rx_adv_conf.rss_conf.rss_hf !=
+      port_conf_default.rx_adv_conf.rss_conf.rss_hf) {
+    RTE_LOG(ERR, EAL,
+            "Port %u modified RSS hash function based on hardware support,"
+            "requested:%#" PRIx64 " configured:%#" PRIx64 "\n",
+            port, port_conf_default.rx_adv_conf.rss_conf.rss_hf,
+            port_conf.rx_adv_conf.rss_conf.rss_hf);
+  }
 
   retval = rte_eth_dev_configure(port, nb_rx_cores, nb_tx_cores, &port_conf);
-  if (retval != 0) return retval;
+  if (retval != 0) rte_exit(EXIT_FAILURE, "Cannot configure port\n");
 
   retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, &nb_txd);
-  if (retval != 0) return retval;
+  if (retval != 0) rte_exit(EXIT_FAILURE, "Cannot adjust desc number\n");
+  RTE_LOG(NOTICE, EAL, "Adjusted nb_rxd = %u, nb_txd = %u\n", nb_rxd, nb_txd);
 
-  for (uint16_t q = 0; q < nb_rx_cores; ++q) {
+  struct rte_eth_rxconf rxconf = dev_info.default_rxconf;
+  rxconf.offloads = port_conf.rxmode.offloads;
+
+  for (auto q : range(nb_rx_cores)) {
     retval = rte_eth_rx_queue_setup(
-        port, q, nb_rxd, rte_eth_dev_socket_id(port), nullptr, rx_mbufpool_);
-    if (retval < 0) return retval;
-    rx_cores_[q].second = q;
+        port, q, nb_rxd, rte_eth_dev_socket_id(port), &rxconf, rx_mbufpool_);
+    if (retval < 0) rte_exit(EXIT_FAILURE, "Cannot setup RX queue\n");
+    rx_cores_[q].queue_id = q;
   }
 
-  struct rte_eth_txconf txconf;
-  memset(&txconf, 0, sizeof(txconf));
-  for (uint16_t q = 0; q < nb_tx_cores; ++q) {
+  uint16_t max_supported_tx_queues = dev_info.max_tx_queues;
+  RTE_LOG(NOTICE, EAL, "max_supported_tx_queues: %u\n",
+          max_supported_tx_queues);
+
+  rte_eth_txconf txconf = dev_info.default_txconf;
+  txconf.offloads = port_conf.txmode.offloads;
+
+  for (auto q : range(nb_tx_cores)) {
     retval = rte_eth_tx_queue_setup(port, q, nb_txd,
                                     rte_eth_dev_socket_id(port), &txconf);
-    if (retval < 0) return retval;
+    if (retval < 0) rte_exit(EXIT_FAILURE, "Cannot setup TX queue\n");
 
     tx_cores_[q].queue_id = q;
-    const int rings_per_core = (TX_RING_COUNT + nb_tx_cores - 1) / nb_tx_cores;
-    for (int i = 0; i < rings_per_core; ++i) {
-      std::string ring_name = "tx_ring_p" + std::to_string(getpid()) + "_c" +
-                              std::to_string(q) + "_i" + std::to_string(i);
-      struct rte_ring *old_ring = rte_ring_lookup(ring_name.c_str());
-      if (old_ring) rte_ring_free(old_ring);
-
-      rte_ring *ring =
-          rte_ring_create(ring_name.c_str(), TX_RING_SIZE, rte_socket_id(),
-                          RING_F_MP_HTS_ENQ | RING_F_SC_DEQ);
-
-      if (ring == nullptr) {
-        std::cerr << "Failed to create tx ring: " << ring_name
-                  << ", Error: " << rte_strerror(rte_errno) << "\n";
-        for (auto &r : tx_cores_[q].rings) rte_ring_free(r);
-        return -1;
-      }
-      tx_cores_[q].rings.push_back(ring);
-    }
-    std::cout << "Create " << tx_cores_[q].rings.size()
-              << " rings for lcore: " << tx_cores_[q].lcore_id << "\n";
   }
 
-  retval = rte_eth_dev_start(port);
-  if (retval < 0) return retval;
-
-  printf("Port %u MAC: " RTE_ETHER_ADDR_PRT_FMT "\n", (unsigned)port,
-         RTE_ETHER_ADDR_BYTES(&s_eth_addr_));
-
   retval = rte_eth_promiscuous_enable(port);
-  if (retval != 0) return retval;
+  if (retval != 0) rte_exit(EXIT_FAILURE, "Cannot set promiscuous\n");
+
+  retval = rte_eth_dev_start(port);
+  if (retval < 0) rte_exit(EXIT_FAILURE, "Cannot start port\n");
+
+  RTE_LOG(NOTICE, EAL, "Port %u MAC: " RTE_ETHER_ADDR_PRT_FMT "\n",
+          (unsigned)port, RTE_ETHER_ADDR_BYTES(&s_eth_addr_));
+
   return 0;
 }
 
-void CacheMigrationDpdk::ProcessReceivedPacket(struct rte_mbuf *mbuf) {
-  uint64_t completed_us = get_now_micros();
-  struct rte_ether_hdr *eth_hdr =
-      rte_pktmbuf_mtod(mbuf, struct rte_ether_hdr *);
-  if (eth_hdr->ether_type != rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4)) return;
+/**
+ * @brief 超时监控函数，负责检查请求是否超时并处理超时请求
+ * @param arg 包含发送配置信息的参数
+ * @return 0 表示正常退出
+ *
+ * 该函数在指定的核心上运行，持续监控指定范围内的请求，
+ * 检查是否有请求超时，并对超时的请求进行重试或标记为失败。
+ * 实现了指数退避的超时重试机制。
+ */
+inline int CacheMigrationDpdk::RunTimeoutMonitor(void* arg) {
+  // 解析参数，获取发送配置信息
+  TxConf* ctx = static_cast<TxConf*>(arg);
+  uint16_t queue_id = ctx->queue_id;   // 获取队列ID
+  size_t start = ctx->interval.first;  // 起始请求ID
+  size_t end = ctx->interval.second;   // 结束请求ID
 
-  struct rte_ipv4_hdr *ip_hdr = (struct rte_ipv4_hdr *)(eth_hdr + 1);
-  if (ip_hdr->next_proto_id != IP_PROTOCOLS_NETCACHE) return;
+  // 定义睡眠间隔时间（微秒）
+  constexpr uint64_t kSleepIntervalUs = 1000;
+  // 最大重试次数限制
+  const uint16_t kMaxRetries = RETRIES;
+  // 批处理大小，将请求分批处理以提高效率
+  size_t kBatchSize = (end - start) / 10;
 
-  struct KVHeader *kv_header = (struct KVHeader *)(ip_hdr + 1);
-  rte_prefetch0(kv_header);
+  // 获取数据包总数
+  size_t total_packets = packets.size();
 
-  const uint32_t request_id = rte_be_to_cpu_32(kv_header->request_id);
+  // 可选调试输出
+  // std::cerr << "Start Timeout Monitor on lcore: " << rte_lcore_id()
+  //           << std::endl;
 
-  const uint8_t is_req = GET_IS_REQ(kv_header->combined);
+  // 主循环：持续监控直到系统停止运行
+  while (running.load(std::memory_order_acquire)) {
+    // 将请求范围分批处理，避免单次处理过多请求
+    for (auto i : range(start, end, kBatchSize)) {
+      // 计算当前批次的结束位置
+      size_t batch_end = std::min(i + kBatchSize, end);
+      // 获取当前时间戳
+      uint64_t now = get_now_micros();
 
-  if (is_req != CACHE_REPLY && is_req != SERVER_REPLY) {
-    // std::cerr << "Server" : "Cache" << "Server rejected request_id = " <<
-    // request_id << std::endl;
-    return;
-  }
+      // 遍历当前批次中的每个请求
+      for (auto request_id : range(i, batch_end)) {
+        // 获取请求信息的引用
+        RequestInfo& req = requests[request_id];
 
-  bool exist = request_map_.Modify(request_id, [&](auto &req) {
-    if (req->completed) {
-      std::cerr << "Duplicate response for request_id = " << request_id
-                << std::endl;
-      return;
-    }
-    req->completed = true;
-    req->completed_us = completed_us;
-    std::string key_str(kv_header->key.begin(), kv_header->key.end());
-    const uint8_t op = GET_OP(kv_header->combined);
-    try {
-      if (op == READ_REQUEST && req->read_promise) {
-        std::vector<KVPair> data;
-        data.reserve(4);
-        const char *base = kv_header->value1.data();
-        for (uint i = 0; i < 4; i++) {
-          data.emplace_back(field_names[i],
-                            std::string(base + i * VALUE_LENGTH, VALUE_LENGTH));
+        // 跳过已完成或已超时的请求
+        if (req.completed.load() || req.time_out.load()) continue;
+
+        // 计算已用时间
+        uint64_t elapsed_time =
+            (now >= req.start_time) ? (now - req.start_time) : 0;
+
+        // 获取当前重试次数
+        int current_retry_count =
+            req.retry_count.load(std::memory_order_acquire);
+
+        // 计算预期超时时间（根据重试次数动态调整）
+        uint64_t expected_timeout = time_out_us(current_retry_count);
+        // 如果未超时，跳过此请求
+        if (elapsed_time < expected_timeout) continue;
+
+        // 检查是否超过最大重试次数
+        if (current_retry_count > kMaxRetries) {
+          // 原子操作标记请求为超时状态
+          if (req.time_out.exchange(true)) continue;
+          // 更新超时计数
+          timeout_count.fetch_add(1, std::memory_order_relaxed);
+          continue;
         }
-        req->read_promise->set_value(std::move(data));
-      } else if (op == WRITE_REQUEST && req->write_promise) {
-        req->write_promise->set_value(true);
-      } else {
-        throw std::runtime_error("The op and the promise do not match");
-      }
 
-      if (ip_hdr->src_addr != consistent_hash_.GetServerIp(key_str)) {
-        consistent_hash_.MigrateKey(kv_header->key, ip_hdr->src_addr);
+        // 计算数据包索引（使用取模运算循环使用数据包）
+        size_t packet_index = request_id % total_packets;
+        if (packet_index >= packets.size()) {
+          std::cerr
+              << "Error: Attempt to access an out-of-bounds packet index: "
+              << packet_index << " limit: " << packets.size() << std::endl;
+          continue;
+        }
+        // 获取要重发的数据包
+        rte_mbuf* packet = packets[packet_index];
+
+        // 检查数据包有效性并尝试重新发送
+        if (packet && !req.completed.load()) {
+          // 发送数据包
+          int sent = rte_eth_tx_burst(0, queue_id, &packet, 1);
+          if (sent == 1) {
+            // 重发成功，更新统计信息
+            // std::cerr << "Time out send" << std::endl;
+            timeout_send.fetch_add(1,
+                                   std::memory_order_relaxed);  // 增加重发计数
+            req.retry_count.fetch_add(
+                1, std::memory_order_relaxed);  // 增加重试次数
+            req.start_time = now;               // 重置开始时间为当前时间
+          }
+        }
       }
-    } catch (const std::future_error &e) {
-      std::cerr << "[Packet] Future error: " << e.what() << std::endl;
+      // 每处理完一批次后短暂休眠，避免过度占用CPU
+      rte_delay_us_block(kSleepIntervalUs);
     }
-  });
-
-  if (!exist) {
-    // std::cerr << "[Packet] Request not exist id: " << request_id <<
-    // std::endl;
   }
+  return 0;
 }
 
+/**
+ * @brief 处理网络接收操作的函数
+ * @param queue_id 要处理的接收队列ID
+ *
+ * 该函数在指定的核心上运行，负责从网络接口接收数据包，
+ * 处理接收到的响应，并标记相应的请求为已完成状态。
+ */
 void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
+  // 获取当前核心ID
   uint lcore_id = rte_lcore_id();
 
+  // 检查核心ID是否有效
   if (lcore_id == RTE_MAX_LCORE || lcore_id == (unsigned)LCORE_ID_ANY) {
-    printf("Invalid lcore_id=%u\n", lcore_id);
+    printf("Invalid lcore_id = %u\n", lcore_id);
     return;
   }
-  if (rte_lcore_is_enabled(lcore_id) && lcore_id != rte_get_main_lcore()) {
-    uint16_t port = 0;
-    uint16_t nb_rx;
 
+  // 检查核心是否启用且不是主核心
+  if (rte_lcore_is_enabled(lcore_id) && lcore_id != rte_get_main_lcore()) {
+    uint16_t port = 0;  // 网络端口号
+    uint16_t nb_rx;     // 接收到的数据包数量
+
+    // 检查端口是否在远程NUMA节点上，可能影响性能
     if (rte_eth_dev_socket_id(port) >= 0 &&
         rte_eth_dev_socket_id(port) != (int)rte_socket_id())
       printf(
@@ -367,72 +531,166 @@ void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
           "not be optimal.\n",
           port);
 
-    struct rte_mbuf *bufs[BURST_SIZE];
+    // 记录核心正在轮询的队列信息
+    RTE_LOG(NOTICE, CORE, "[RX] %u polling queue: %hu\n", lcore_id, queue_id);
 
+    // 用于存储接收到的数据包的缓冲区
+    rte_mbuf* bufs[BURST_SIZE];
+
+    // 主循环：持续接收数据包直到系统停止运行
     while (running.load(std::memory_order_acquire)) {
+      // 从网络端口批量接收数据包
       nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
 
+      // 如果没有接收到数据包，继续轮询
       if (unlikely(nb_rx == 0)) {
-        rte_delay_us(10);
         continue;
-      }
+      } else {
+        // 更新完成的请求计数
+        completed_count.fetch_add(nb_rx, std::memory_order_relaxed);
 
-      if (nb_rx > 0) {
-        for (uint16_t i = 0; i < nb_rx; i++) {
-          if (bufs[i] != NULL) {
-            ProcessReceivedPacket(bufs[i]);
-            rte_pktmbuf_free(bufs[i]);
-          }
+        // 处理每个接收到的数据包
+        for (auto i : range(nb_rx)) {
+          // 从数据包中提取KV请求头部
+          KVRequest* kv_header =
+              rte_pktmbuf_mtod_offset(bufs[i], KVRequest*, KV_HEADER_OFFSET);
+
+          // 标记对应的请求为已完成状态
+          requests[rte_be_to_cpu_32(kv_header->request_id)].completed.exchange(
+              true);
+
+          // 释放数据包内存
+          rte_pktmbuf_free(bufs[i]);
         }
       }
     }
-    return;
   } else {
+    // 跳过主核心，避免干扰主核心的工作
     printf("Skip main lcore %u\n", lcore_id);
   }
   return;
 }
 
-inline int CacheMigrationDpdk::TxMain(void *arg) {
-  TxConf *ctx = static_cast<TxConf *>(arg);
-  struct rte_mbuf *bufs[BURST_SIZE];
-  uint nb_deq;
-  uint16_t nb_tx;
-  auto rings = ctx->rings;
-  for (auto &ring : rings) {
-    if (ring == nullptr) {
-      std::cerr << "Ring is null in TxMain\n";
-      return -1;
-    }
-  }
+inline int CacheMigrationDpdk::RxMain(void* arg) {
+  RxArgs* args = static_cast<RxArgs*>(arg);
+  args->instance->DoRx(args->queue_id);
+  return 0;
+}
+
+/**
+ * @brief 处理网络发送操作的主函数
+ * @param arg 包含发送配置信息的参数
+ * @return 0 表示成功
+ *
+ * 该函数在指定的核心上运行，负责发送网络数据包，
+ * 处理发送结果，统计发送成功和失败的数量，
+ * 并在发送完成后启动超时监控。
+ */
+inline int CacheMigrationDpdk::TxMain(void* arg) {
+  // 解析参数，获取发送配置信息
+  TxConf* ctx = static_cast<TxConf*>(arg);
+
+  // 初始化发送统计计数器
+  uint64_t tx_success_count = 0;  // 成功发送的数据包数量
+  uint64_t tx_drop_count = 0;     // 丢弃的数据包数量
+
+  // 从配置中获取队列ID和请求处理范围
   uint16_t queue_id = ctx->queue_id;
-  while (running.load(std::memory_order_acquire)) {
-    bool got_pkts = false;
-    for (auto *ring : rings) {
-      nb_deq = rte_ring_dequeue_burst(ring, (void **)bufs, BURST_SIZE, NULL);
-      if (nb_deq == 0) {
-        continue;
-      }
-      got_pkts = true;
+  size_t start = ctx->interval.first;  // 起始请求ID
+  size_t end = ctx->interval.second;   // 结束请求ID
 
-      nb_tx = rte_eth_tx_burst(0, queue_id, bufs, nb_deq);
-      for (uint16_t i = nb_tx; i < nb_deq; i++) {
-        rte_pktmbuf_free(bufs[i]);
-      }
+  // 获取数据包总数
+  size_t total_packets_num = packets.size();
+
+  // 记录发送开始时间
+  send_start_us = get_now_micros();
+
+  // 批量发送数据包
+  constexpr uint16_t BATCH_SIZE =
+      BURST_SIZE;  // 使用定义的BURST_SIZE作为批量大小
+  rte_mbuf* batch_packets[BATCH_SIZE];
+  size_t batch_index = 0;
+
+  // 遍历处理指定范围内的请求
+  for (auto request_id : range(start, end)) {
+    // 设置请求开始时间
+    requests[request_id].start_time = get_now_micros();
+
+    // 计算数据包索引（使用取模运算循环使用数据包）
+    size_t packet_index = request_id % total_packets_num;
+    if (packet_index >= packets.size()) {
+      std::cerr << "Error: Attempt to access an out-of-bounds packet index: "
+                << packet_index << " limit: " << packets.size() << std::endl;
+      continue;
     }
 
-    if (!got_pkts) {
-      rte_pause();
+    // 获取数据包并解析网络头部
+    rte_mbuf* packet = packets[packet_index];
+
+    // 解析KV请求头部
+    auto* kv_header =
+        rte_pktmbuf_mtod_offset(packet, KVRequest*, KV_HEADER_OFFSET);
+    if (unlikely(kv_header == nullptr)) {
+      std::cerr << "Error: Invalid KVHeader pointer" << std::endl;
+      continue;
+    }
+
+    // 设置请求ID（转换为网络字节序）
+    kv_header->request_id = rte_cpu_to_be_32(request_id);
+
+    // 获取操作类型（读或写）
+    const uint8_t op = GET_OP(kv_header->combined);
+
+    // 更新操作类型统计
+    (op == READ_REQUEST ? read_count : update_count)
+        .fetch_add(1, std::memory_order_relaxed);
+
+    // 将数据包添加到批处理数组
+    batch_packets[batch_index++] = packet;
+
+    // 当批处理数组满或到达请求末尾时发送数据包
+    if (batch_index == BATCH_SIZE || request_id == end - 1) {
+      if (batch_index > 0) {
+        // 发送批量数据包
+        uint16_t nb_tx =
+            rte_eth_tx_burst(0, queue_id, batch_packets, batch_index);
+
+        // 更新统计信息
+        tx_success_count += nb_tx;
+        tx_drop_count += (batch_index - nb_tx);
+
+        // 处理发送失败的数据包
+        for (auto i : range(nb_tx, batch_index)) {
+          // 计算对应的请求ID
+          size_t failed_request_id = request_id - (batch_index - 1) + i;
+          if (failed_request_id >= start && failed_request_id < end) {
+            requests[failed_request_id].completed.store(true);
+            false_count.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+
+        // 重置批处理索引
+        batch_index = 0;
+      }
     }
   }
+
+  // 打印发送统计信息
+  std::cout << "TX thread [" << rte_lcore_id() << "] sent " << tx_success_count
+            << " drop " << tx_drop_count << " requests (queue " << queue_id
+            << ")" << std::endl;
+
+  // 启动超时监控
+  RunTimeoutMonitor(arg);
   return 0;
 }
 
 inline void CacheMigrationDpdk::LaunchThreads() {
-  for (auto &core : rx_cores_) {
+  rx_args_.clear();
+  for (auto& core : rx_cores_) {
     try {
-      uint core_id = core.first;
-      uint16_t queue_id = core.second;
+      uint core_id = core.lcore_id;
+      uint16_t queue_id = core.queue_id;
       auto args = std::make_unique<RxArgs>();
       args->instance = this;
       args->queue_id = queue_id;
@@ -444,26 +702,30 @@ inline void CacheMigrationDpdk::LaunchThreads() {
                   << ", error: " << rte_strerror(-ret) << std::endl;
         return;
       }
-    } catch (const std::exception &e) {
+    } catch (const std::exception& e) {
       std::cerr << "Exception launching RX thread: " << e.what() << std::endl;
       return;
     }
   }
 
-  for (auto &core : tx_cores_) {
-    uint lcore_id = core.lcore_id;
-    uint16_t queue_id = core.queue_id;
-    auto rings = core.rings;
-    for (auto *ring : rings) {
-      if (ring == nullptr) {
-        std::cerr << "Ring is null in TxMain\n";
-        return;
-      }
-    }
+  tx_args_.clear();
+  size_t total = requests.size();
+  size_t num_tx_cores = tx_cores_.size();
+  size_t per_core = total / num_tx_cores;
+  size_t remainder = total % num_tx_cores;
+
+  size_t offset = 0;
+  for (auto i : range(num_tx_cores)) {
+    uint lcore_id = tx_cores_[i].lcore_id;
+    uint16_t queue_id = tx_cores_[i].queue_id;
+
     auto tx_conf = std::make_unique<TxConf>();
     tx_conf->lcore_id = lcore_id;
     tx_conf->queue_id = queue_id;
-    tx_conf->rings = std::move(rings);
+
+    size_t length = per_core + (i < remainder ? 1 : 0);
+    tx_conf->interval = {offset, offset + length};
+    offset += length;
 
     tx_args_.push_back(std::move(tx_conf));
     int ret = rte_eal_remote_launch(TxMain, tx_args_.back().get(), lcore_id);
@@ -475,271 +737,155 @@ inline void CacheMigrationDpdk::LaunchThreads() {
   }
 }
 
-struct rte_mbuf *CacheMigrationDpdk::BuildRequestPacket(
-    const std::string &key, uint8_t op, uint32_t req_id,
-    const std::vector<KVPair> &values) {
-  struct rte_mbuf *mbuf = rte_pktmbuf_alloc(tx_mbufpool_);
+rte_mbuf* CacheMigrationDpdk::BuildRequestPacket(
+    const std::string& key, uint8_t op, uint32_t req_id,
+    const std::vector<KVPair>& values) {
+  if (dev_infos_.empty()) {
+    RTE_LOG(ERR, PACKET, "No source IP available for packet construction\n");
+    return nullptr;
+  }
+
+  const size_t value_count = values.size();
+  if (value_count == 0) {
+    RTE_LOG(WARNING, PACKET,
+            "BuildRequestPacket called with empty values vector\n");
+  }
+  auto selected = dev_infos_[0];
+  rte_be32_t src_ip = selected.src_ip;
+  uint16_t dev_id = selected.dev_id;
+
+  rte_mbuf* mbuf = rte_pktmbuf_alloc(tx_mbufpool_);
   if (!mbuf) return nullptr;
 
-  char *pkt_data = rte_pktmbuf_append(mbuf, TOTAL_LEN);
+  char* pkt_data = rte_pktmbuf_append(mbuf, TOTAL_LEN);
   if (!pkt_data) {
     rte_pktmbuf_free(mbuf);
     std::cerr << "Failed to append packet data\n";
     return nullptr;
   }
 
-  struct rte_ether_hdr *eth_hdr = reinterpret_cast<rte_ether_hdr *>(pkt_data);
+  rte_ether_hdr* eth_hdr = reinterpret_cast<rte_ether_hdr*>(pkt_data);
   rte_ether_addr_copy(&s_eth_addr_, &eth_hdr->src_addr);
   rte_ether_addr_copy(&d_eth_addr_, &eth_hdr->dst_addr);
   eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
 
-  struct rte_ipv4_hdr *ip_hdr =
-      reinterpret_cast<rte_ipv4_hdr *>(pkt_data + RTE_ETHER_HDR_LEN);
+  rte_ipv4_hdr* ip_hdr = reinterpret_cast<rte_ipv4_hdr*>(eth_hdr + 1);
   ip_hdr->ihl = 5;
   ip_hdr->version = 4;
   ip_hdr->type_of_service = 0;
   ip_hdr->total_length = rte_cpu_to_be_16(TOTAL_LEN - RTE_ETHER_HDR_LEN);
   ip_hdr->packet_id = rte_cpu_to_be_16(54321);
-  ip_hdr->next_proto_id = IP_PROTOCOLS_NETCACHE;
+  ip_hdr->next_proto_id = IPPROTO_UDP;
   ip_hdr->time_to_live = 64;
-  ip_hdr->src_addr = src_ip_;
+  ip_hdr->src_addr = src_ip;
   ip_hdr->dst_addr = consistent_hash_.GetServerIp(key);
   ip_hdr->hdr_checksum = 0;
   ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
 
-  struct KVHeader *kv_header =
-      reinterpret_cast<KVHeader *>(pkt_data + RTE_ETHER_HDR_LEN + IPV4_HDR_LEN);
-  uint16_t combined = ENCODE_COMBINED(dev_id_, op);
-  kv_header->request_id = rte_cpu_to_be_32(req_id);
-  kv_header->combined = rte_cpu_to_be_16(combined);
-  memcpy(kv_header->key.data(), key.data(), KEY_LENGTH);
-  memcpy(kv_header->value1.data(), values[0].second.data(), VALUE_LENGTH);
-  memcpy(kv_header->value2.data(), values[1].second.data(), VALUE_LENGTH);
-  memcpy(kv_header->value3.data(), values[2].second.data(), VALUE_LENGTH);
-  memcpy(kv_header->value4.data(), values[3].second.data(), VALUE_LENGTH);
+  rte_udp_hdr* udp_hdr = reinterpret_cast<rte_udp_hdr*>(ip_hdr + 1);
+  udp_hdr->src_port = rte_cpu_to_be_16(UDP_PORT_KV);
+  udp_hdr->dst_port = rte_cpu_to_be_16(UDP_PORT_KV);
+  udp_hdr->dgram_len = rte_cpu_to_be_16(UDP_HDR_LEN + KV_HDR_LEN);
+  udp_hdr->dgram_cksum = rte_ipv4_udptcp_cksum(ip_hdr, udp_hdr);
+
+  KVRequest* kv_request = reinterpret_cast<KVRequest*>(udp_hdr + 1);
+  kv_request->dev_info =
+      static_cast<uint8_t>(ENCODE_DEV_INFO(dev_id, DEV_CLIENT));
+  kv_request->request_id = rte_cpu_to_be_32(req_id);
+  kv_request->combined =
+      static_cast<uint8_t>(ENCODE_COMBINED(CLIENT_REQUEST, op));
+  rte_memcpy(kv_request->key.data(), key.data(), KEY_LENGTH);
+  rte_memcpy(kv_request->value1.data(), values[0].second.data(), VALUE_LENGTH);
+  rte_memcpy(kv_request->value2.data(), values[1].second.data(), VALUE_LENGTH);
+  rte_memcpy(kv_request->value3.data(), values[2].second.data(), VALUE_LENGTH);
+  rte_memcpy(kv_request->value4.data(), values[3].second.data(), VALUE_LENGTH);
   return mbuf;
 }
 
-int CacheMigrationDpdk::Read(const std::string & /*table*/,
-                             const std::string &key,
-                             const std::vector<std::string> * /*fields*/,
-                             std::vector<KVPair> &result) {
-  const uint32_t req_id = utils::generate_request_id();
+int CacheMigrationDpdk::Read(const std::string& /*table*/,
+                             const std::string& key,
+                             const std::vector<std::string>* /*fields*/,
+                             std::vector<KVPair>& /*result*/) {
+  const uint32_t req_id = 0;
 
-  read_count_.fetch_add(1, std::memory_order_relaxed);
-
-  auto read_promise = std::make_shared<std::promise<std::vector<KVPair>>>();
-  auto future = read_promise->get_future();
-
-  auto request = std::make_shared<RequestInfo>();
-  request->read_promise = read_promise;
-
-  if (!request_map_.Insert(req_id, request)) {
-    no_result_.fetch_add(1, std::memory_order_relaxed);
-    std::cerr << "[Read] Error to insert request: " << req_id << std::endl;
-    return DB::kErrorConflict;
-  }
-
-  RequestCleaner cleaner(request_map_, req_id);
-
-  rte_mbuf *mbuf =
+  rte_mbuf* mbuf =
       BuildRequestPacket(key, READ_REQUEST, req_id, DEFAULT_VALUES);
   if (!mbuf) {
-    no_result_.fetch_add(1, std::memory_order_relaxed);
+    false_count.fetch_add(1, std::memory_order_relaxed);
+    std::cerr << "Fail to creat mbuf for: " << req_id << std::endl;
     return DB::kErrorNoData;
   }
-  std::unique_ptr<rte_mbuf, decltype(&rte_pktmbuf_free)> mbuf_guard(
-      mbuf, rte_pktmbuf_free);
 
-  try {
-    for (int attempt = 0; attempt < RETRIES; ++attempt) {
-      uint64_t start_us = get_now_micros();
+  packets.push_back(mbuf);
 
-      if (rte_ring_enqueue(assigned_ring, mbuf) < 0)
-        throw std::runtime_error("Failed to enqueue packet");
-
-      mbuf_guard.release();
-
-      if (future.wait_for(std::chrono::milliseconds(100)) ==
-          std::future_status::ready) {
-        uint64_t latency_us = 0;
-        bool found = request_map_.Visit(req_id, [&](const auto &req) {
-          latency_us = req->completed_us - start_us;
-        });
-        if (!found) {
-          std::cerr << "Request not found when computing latency\n";
-          return DB::kErrorNoData;
-        }
-        thread_stats.total_latency_us += latency_us;
-        thread_stats.completed_requests++;
-
-        result = future.get();
-        read_success_.fetch_add(1, std::memory_order_relaxed);
-        return DB::kOK;
-      }
-      mbuf = BuildRequestPacket(key, READ_REQUEST, req_id, DEFAULT_VALUES);
-      if (!mbuf) throw std::runtime_error("Rebuild packet failed");
-      mbuf_guard.reset(mbuf);
-      exponentialBackoff(attempt);
-    }
-    throw std::runtime_error("Max retries exceeded");
-  } catch (const std::exception &e) {
-    std::cerr << "[Read] Error: " << e.what() << ", req_id: " << req_id
-              << std::endl;
-    no_result_.fetch_add(1, std::memory_order_relaxed);
-    return DB::kErrorNoData;
-  }
+  return DB::kOK;
 }
 
-int CacheMigrationDpdk::Insert(const std::string & /*table*/,
-                               const std::string &key,
-                               std::vector<KVPair> &values) {
-  const uint32_t req_id = utils::generate_request_id();
-  update_count_.fetch_add(1, std::memory_order_relaxed);
+int CacheMigrationDpdk::Insert(const std::string& /*table*/,
+                               const std::string& key,
+                               std::vector<KVPair>& values) {
+  const uint32_t req_id = 0;
 
-  auto write_promise = std::make_shared<std::promise<bool>>();
-  auto future = write_promise->get_future();
-
-  auto request = std::make_shared<RequestInfo>();
-  request->write_promise = write_promise;
-
-  if (!request_map_.Insert(req_id, request)) {
-    update_failed_.fetch_add(1, std::memory_order_relaxed);
-    std::cerr << "[Insert] Error to insert request: " << req_id << std::endl;
-    return DB::kErrorConflict;
-  }
-
-  RequestCleaner cleaner(request_map_, req_id);
-
-  rte_mbuf *mbuf = BuildRequestPacket(key, WRITE_REQUEST, req_id, values);
+  rte_mbuf* mbuf = BuildRequestPacket(key, WRITE_REQUEST, req_id, values);
   if (!mbuf) {
-    throw std::runtime_error("Failed to build request packet");
-  }
-
-  std::unique_ptr<rte_mbuf, decltype(&rte_pktmbuf_free)> mbuf_guard(
-      mbuf, rte_pktmbuf_free);
-
-  try {
-    for (int attempt = 0; attempt < RETRIES; ++attempt) {
-      uint64_t start_us = get_now_micros();
-
-      if (rte_ring_enqueue(assigned_ring, mbuf) < 0) {
-        throw std::runtime_error("Failed to enqueue packet");
-      }
-      mbuf_guard.release();
-
-      if (future.wait_for(std::chrono::milliseconds(100)) ==
-          std::future_status::ready) {
-        if (future.get()) {
-          uint64_t latency_us = 0;
-          bool found = request_map_.Visit(req_id, [&](const auto &req) {
-            latency_us = req->completed_us - start_us;
-          });
-          if (!found) {
-            std::cerr << "Request not found when computing latency\n";
-            return DB::kErrorNoData;
-          }
-          thread_stats.total_latency_us += latency_us;
-          thread_stats.completed_requests++;
-
-          update_success_.fetch_add(1, std::memory_order_relaxed);
-          return DB::kOK;
-        } else {
-          return DB::kErrorRejected;
-        }
-      }
-      mbuf = BuildRequestPacket(key, WRITE_REQUEST, req_id, values);
-      if (!mbuf) throw std::runtime_error("Rebuild packet failed");
-      mbuf_guard.reset(mbuf);
-      exponentialBackoff(attempt);
-    }
-    throw std::runtime_error("Max retries exceeded");
-  } catch (const std::exception &e) {
-    std::cerr << "[Insert] Error: " << e.what() << ", req_id: " << req_id
-              << std::endl;
-    update_failed_.fetch_add(1, std::memory_order_relaxed);
+    false_count.fetch_add(1, std::memory_order_relaxed);
+    std::cerr << "Fail to creat mbuf for: " << req_id << std::endl;
     return DB::kErrorNoData;
   }
+
+  packets.push_back(mbuf);
+
+  return DB::kOK;
 }
 
-int CacheMigrationDpdk::Update(const std::string &table, const std::string &key,
-                               std::vector<KVPair> &values) {
+int CacheMigrationDpdk::Update(const std::string& table, const std::string& key,
+                               std::vector<KVPair>& values) {
   return Insert(table, key, values);
 }
 
-int CacheMigrationDpdk::Scan(const std::string & /*table*/,
-                             const std::string & /*key*/, int /*record_count*/,
-                             const std::vector<std::string> * /*key*/,
-                             std::vector<std::vector<KVPair>> & /*result*/) {
+int CacheMigrationDpdk::Scan(const std::string& /*table*/,
+                             const std::string& /*key*/, int /*record_count*/,
+                             const std::vector<std::string>* /*key*/,
+                             std::vector<std::vector<KVPair>>& /*result*/) {
   return DB::kOK;  // Not implemented for now
 }
 
-int CacheMigrationDpdk::Delete(const std::string &table,
-                               const std::string &key) {
+int CacheMigrationDpdk::Delete(const std::string& table,
+                               const std::string& key) {
   return Update(table, key, DEFAULT_VALUES);
 }
 
 void CacheMigrationDpdk::PrintStats() {
-  std::vector<double> iopss(all_thread_stats_.size(), 0.0);
-  std::vector<double> latency_uss(all_thread_stats_.size(), 0.0);
-  double total_iops = 0.0;
-  uint64_t total_completed = 0;
-  uint64_t max_thread_latency_us = 0;
-  uint64_t total_latency_us_all_threads = 0;
+  uint64_t total_request = total_request_count.load(std::memory_order_relaxed);
+  uint64_t completed = completed_count.load(std::memory_order_relaxed);
+  completed = completed <= total_request_count ? completed : total_request;
+  uint64_t total_latency = total_latency_us.load(std::memory_order_relaxed);
 
-  for (size_t i = 0; i < all_thread_stats_.size(); ++i) {
-    const auto &s = all_thread_stats_[i];
-    double iops = s.total_latency_us > 0
-                      ? s.completed_requests * 1'000'000.0 / s.total_latency_us
-                      : 0.0;
-    double latency_us =
-        s.completed_requests > 0
-            ? static_cast<double>(s.total_latency_us) / s.completed_requests
-            : 0.0;
+  double iops = use_time_us > 0
+                    ? static_cast<double>(completed) * 1'000'000.0 / use_time_us
+                    : 0.0;
 
-    iopss[i] = iops;
-    latency_uss[i] = latency_us;
-
-    std::cout << " Thread[ " << i << " ]\n"
-              << "total_latency_us = " << s.total_latency_us << "\n"
-              << "completed_requests = " << s.completed_requests << "\n"
-              << "iops = " << iops << "\n";
-
-    total_iops += iops;
-
-    total_completed += s.completed_requests;
-    total_latency_us_all_threads += s.total_latency_us;
-
-    if (s.total_latency_us > max_thread_latency_us) {
-      max_thread_latency_us = s.total_latency_us;
-    }
-  }
-
-  double conservative_total_iops =
-      max_thread_latency_us > 0
-          ? total_completed / (max_thread_latency_us / 1'000'000.0)
-          : 0.0;
+  double latency_us_per_request =
+      completed > 0 ? static_cast<double>(total_latency) / completed : 0.0;
 
   double average_latency_us =
-      total_completed > 0
-          ? static_cast<double>(max_thread_latency_us) / total_completed
-          : 0.0;
+      completed > 0 ? static_cast<double>(use_time_us) / completed : 0.0;
 
-  all_thread_stats_.clear();
-
+  std::cout << std::fixed << std::setprecision(2);
   std::cout << "[Stats] CacheMigrationDpdk Statistics:\n"
-            << "Per-thread IOPS sum: " << total_iops << " ops/sec\n"
-            << "Total completed requests: " << total_completed << "\n"
-            << "Max thread run time: " << max_thread_latency_us / 1e6 << " s\n"
-            << "System IOPS (total_requests / max_thread_time): "
-            << conservative_total_iops << " ops/sec\n"
-            << "Average latency per request: " << average_latency_us << " us\n"
-            << "  Total Reads: " << read_count_.load() << "\n"
-            << "  Successful Reads: " << read_success_.load() << "\n"
-            << "  No Result Reads: " << no_result_.load() << "\n"
-            << "  Total Updates: " << update_count_.load() << "\n"
-            << "  Successful Updates: " << update_success_.load() << "\n"
-            << "  Failed Updates: " << update_failed_.load() << "\n";
+            << "Total Requests: " << total_request << "\n"
+            << "Total Requests Completed: " << completed << "\n"
+            << "Total Time (s): " << use_time_us / 1'000'000.0 << "\n"
+            << "IOPS: " << iops << "( " << iops / 1'000'000.0 << " M)"
+            << " ops/sec\n"
+            << "Average Latency per Request (ms/op): "
+            << latency_us_per_request / 1'000.0 << "\n"
+            << "Average Time per Request (us/op): " << average_latency_us
+            << "\n"
+            << "  Total Reads: " << read_count.load() << "\n"
+            << "  Total Updates: " << update_count.load() << "\n"
+            << "  Time Out: " << timeout_count.load() << "\n"
+            << "  TimeoutMonitor Send: " << timeout_send.load() << std::endl;
 }
 
 }  // namespace ycsbc

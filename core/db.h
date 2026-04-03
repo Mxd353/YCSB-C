@@ -22,12 +22,20 @@ class DB {
   static const int kErrorConflict = 2;
   static const int kErrorTimeout = 3;
   static const int kErrorRejected = 4;
+
+  void SetName(const std::string &name) { name_ = name; }
+  const std::string &GetName() const { return name_; }
+
+  virtual void AllocateSpace(size_t total_ops, size_t req_size) {
+    (void)total_ops;
+    (void)req_size;
+  }
   ///
   /// Initializes any state for accessing this DB.
   /// Called once per DB client (thread); there is a single DB instance
   /// globally.
   ///
-  virtual void Init() {}
+  virtual void Init(const int thread_id) = 0;
   ///
   /// Clears any state for accessing this DB.
   /// Called once per DB client (thread); there is a single DB instance
@@ -98,7 +106,11 @@ class DB {
 
   virtual void PrintStats() {};
 
+  DB() : name_("") {}
   virtual ~DB() {}
+
+ private:
+  std::string name_;
 };
 
 }  // namespace ycsbc

@@ -1,4 +1,5 @@
 cmake_minimum_required(VERSION 4.0)
+
 project(ycsbc
     VERSION 1.0
     LANGUAGES CXX
@@ -39,7 +40,7 @@ if(EXISTS "${HOME_DIR}/lib/boost")
     set(BOOST_ROOT "${HOME_DIR}/lib/boost")
     set(Boost_NO_SYSTEM_PATHS ON)
 endif()
-find_package(Boost REQUIRED COMPONENTS system)
+find_package(Boost 1.90.0 REQUIRED)
 if(Boost_FOUND)
     message(STATUS "Boost found: ${Boost_VERSION}")
     message(STATUS "Boost include dir: ${Boost_INCLUDE_DIRS}")
@@ -71,12 +72,9 @@ if(EXISTS "${HOME_DIR}/lib/dpdk")
     set(DPDK_LIB_DIR "${DPDK_PATH}/lib/x86_64-linux-gnu")
     set(ENV{PKG_CONFIG_PATH} "${DPDK_LIB_DIR}/pkgconfig:$ENV{PKG_CONFIG_PATH}")
 endif()
-find_package(PkgConfig REQUIRED)
 pkg_check_modules(DPDK REQUIRED libdpdk)
-include_directories(${DPDK_INCLUDE_DIRS})
-link_directories(${DPDK_LIBRARY_DIRS})
 if(DPDK_FOUND)
-    message(STATUS "DPDK_INCLUDE_DIRS: ${DPDK_PATH}/include")
+    message(STATUS "DPDK_INCLUDE_DIRS: ${DPDK_INCLUDE_DIRS}")
     message(STATUS "DPDK_LIBRARY_DIRS: ${DPDK_LIBRARY_DIRS}")
     message(STATUS "DPDK_LIBRARIES: ${DPDK_LIBRARIES}")
 else()
@@ -97,18 +95,18 @@ add_executable(${TARGET_NAME} ${SOURCE_FILES})
 
 target_include_directories(${TARGET_NAME}
     PUBLIC
-        ${BOOST_ROOT}/include
-        ${DPDK_PATH}/include
+        ${Boost_INCLUDE_DIRS}
+        ${DPDK_INCLUDE_DIRS}
 )
 
 target_link_directories(${TARGET_NAME}
     PUBLIC
-        ${DPDK_LIB_DIR}
+        ${DPDK_LIBRARY_DIRS}
 )
 
 target_link_libraries(${TARGET_NAME}
     PUBLIC
-        Boost::system
+        ${Boost_LIBRARIES}
         TBB::tbb
         Threads::Threads
         ${DPDK_LIBRARIES}

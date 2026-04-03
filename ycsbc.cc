@@ -13,12 +13,14 @@
 #include <future>
 #include <iostream>
 #include <string>
+#include <typeinfo>
 #include <vector>
 
 #include "core/client.h"
 #include "core/core_workload.h"
 #include "core/timer.h"
 #include "core/utils.h"
+#include "db/cache_migration_dpdk.h"
 #include "db/db_factory.h"
 
 using namespace std;
@@ -33,8 +35,8 @@ void Init(utils::Properties &props);
 void PrintInfo(utils::Properties &props);
 
 int DelegateClient(ycsbc::DB *db, ycsbc::CoreWorkload *wl, const int num_ops,
-                   const int /*thread_id*/, bool is_loading) {
-  db->Init();
+                   const int thread_id, bool is_loading) {
+  db->Init(thread_id);
   struct DBCleaner {
     ycsbc::DB *db;
     ~DBCleaner() { db->Close(); }
@@ -43,7 +45,7 @@ int DelegateClient(ycsbc::DB *db, ycsbc::CoreWorkload *wl, const int num_ops,
   ycsbc::Client client(*db, *wl);
   int oks = 0;
 
-  for (int i = 0; i < num_ops; ++i) {
+  for (int i = 0; i < num_ops; i++) {
     oks += is_loading ? client.DoInsert() : client.DoTransaction();
   }
 
@@ -77,15 +79,15 @@ int main(const int argc, const char *argv[]) {
   if (load) {
     // Loads data
     total_ops = stoi(props[ycsbc::CoreWorkload::RECORD_COUNT_PROPERTY]);
+    db->AllocateSpace(total_ops, total_ops);
 
     int threads_to_launch = std::min(num_threads, total_ops);
     int ops_per_thread = total_ops / threads_to_launch;
     int remaining_ops = total_ops % threads_to_launch;
 
     fprintf(stderr, "Do load use %d threads...\n", threads_to_launch);
-    timer.Start();
 
-    for (int i = 0; i < threads_to_launch; ++i) {
+    for (auto i : utils::range(threads_to_launch)) {
       int ops_to_process = ops_per_thread + (i < remaining_ops ? 1 : 0);
       actual_ops.emplace_back(async(launch::async, DelegateClient, db, &wl,
                                     ops_to_process, i, true));
@@ -101,15 +103,25 @@ int main(const int argc, const char *argv[]) {
         std::cerr << "Error in thread: " << e.what() << std::endl;
       }
     }
-    auto use_time = timer.End();
     fflush(stderr);
 
-    printf("********** load result **********\n");
-    printf(
-        "Total ops  : %5d  use time: %6.3f s  IOPS: %6.2f iops (%6.2f us/op)\n",
-        sum, use_time / 1e6, sum * 1e6 / use_time, (double)use_time / sum);
+    if (db && db->GetName() == "cache_migration_dpdk") {
+      auto *cmd = dynamic_cast<ycsbc::CacheMigrationDpdk *>(db);
+      if (cmd) {
+        cmd->StartDpdk();
+      } else {
+        std::cerr << "Error: DB name is 'cache_migration_dpdk' but "
+                     "dynamic_cast failed.\n";
+      }
+    }
 
-    printf("*********************************\n");
+    // printf("********** load result **********\n");
+    // printf(
+    //     "Total ops  : %5d  use time: %6.3f s  IOPS: %6.2f iops (%6.2f
+    //     us/op)\n", sum, use_time / 1e6, sum * 1e6 / use_time,
+    //     (double)use_time / sum);
+
+    // printf("*********************************\n");
 
     if (print_stats) {
       printf("-------------- db statistics --------------\n");
@@ -122,21 +134,21 @@ int main(const int argc, const char *argv[]) {
   }
 
   // Peforms transactions
-  for (int j = 0; j < ycsbc::Operation::READMODIFYWRITE + 1; j++) {
+  for (auto j : utils::range(ycsbc::Operation::READMODIFYWRITE + 1)) {
     ops_cnt[j].store(0);
     ops_time[j].store(0);
   }
 
   actual_ops.clear();
   total_ops = stoi(props[ycsbc::CoreWorkload::OPERATION_COUNT_PROPERTY]);
-
+  db->AllocateSpace(total_ops, REQ_SIZE);
   int threads_to_launch = std::min(num_threads, total_ops);
   int ops_per_thread = total_ops / threads_to_launch;
 
   fprintf(stderr, "Do run use %d threads...\n", threads_to_launch);
   timer.Start();
 
-  for (int i = 0; i < threads_to_launch; ++i) {
+  for (auto i : utils::range(threads_to_launch)) {
     actual_ops.emplace_back(async(launch::async, DelegateClient, db, &wl,
                                   ops_per_thread, i, false));
   }
@@ -150,62 +162,72 @@ int main(const int argc, const char *argv[]) {
       std::cerr << "Error in thread: " << e.what() << std::endl;
     }
   }
-  auto use_time = timer.End();
+  // auto use_time = timer.End();
   fflush(stderr);
 
-  uint64_t temp_cnt[ycsbc::Operation::READMODIFYWRITE + 1];
-  uint64_t temp_time[ycsbc::Operation::READMODIFYWRITE + 1];
+  // uint64_t temp_cnt[ycsbc::Operation::READMODIFYWRITE + 1];
+  // uint64_t temp_time[ycsbc::Operation::READMODIFYWRITE + 1];
 
-  for (int j = 0; j < ycsbc::Operation::READMODIFYWRITE + 1; j++) {
-    temp_cnt[j] = ops_cnt[j].load(std::memory_order_relaxed);
-    temp_time[j] = ops_time[j].load(std::memory_order_relaxed);
-  }
+  // for (int j = 0; j < ycsbc::Operation::READMODIFYWRITE + 1; j++) {
+  //   temp_cnt[j] = ops_cnt[j].load(std::memory_order_relaxed);
+  //   temp_time[j] = ops_time[j].load(std::memory_order_relaxed);
+  // }
 
-  printf("********** run result **********\n");
-  printf("Total ops      : %d\n", sum);
-  printf("Total wall time: %7.3f s\n", use_time / 1e6);
-  printf("Overall IOPS   : %7.2f\n", sum * 1e6 / use_time);
-  printf("Avg Latency    : %6.2f us\n\n", (double)use_time / sum);
+  // printf("********** run result **********\n");
+  // printf("Total ops      : %d\n", sum);
+  // printf("Total wall time: %7.3f s\n", use_time / 1e6);
+  // printf("Overall IOPS   : %7.2f\n", sum * 1e6 / use_time);
+  // printf("Avg Latency    : %6.2f us\n\n", (double)use_time / sum);
 
-  for (int op = 0; op <= ycsbc::Operation::READMODIFYWRITE; ++op) {
-    if (temp_cnt[op] == 0) continue;
+  // for (int op = 0; op <= ycsbc::Operation::READMODIFYWRITE; ++op) {
+  //   if (temp_cnt[op] == 0) continue;
 
-    const char *opname = nullptr;
-    switch (op) {
-      case ycsbc::READ:
-        opname = "READ";
-        break;
-      case ycsbc::UPDATE:
-        opname = "UPDATE";
-        break;
-      case ycsbc::INSERT:
-        opname = "INSERT";
-        break;
-      case ycsbc::SCAN:
-        opname = "SCAN";
-        break;
-      case ycsbc::READMODIFYWRITE:
-        opname = "RMW";
-        break;
-      default:
-        opname = "UNKNOWN";
-        break;
+  //   const char *opname = nullptr;
+  //   switch (op) {
+  //     case ycsbc::READ:
+  //       opname = "READ";
+  //       break;
+  //     case ycsbc::UPDATE:
+  //       opname = "UPDATE";
+  //       break;
+  //     case ycsbc::INSERT:
+  //       opname = "INSERT";
+  //       break;
+  //     case ycsbc::SCAN:
+  //       opname = "SCAN";
+  //       break;
+  //     case ycsbc::READMODIFYWRITE:
+  //       opname = "RMW";
+  //       break;
+  //     default:
+  //       opname = "UNKNOWN";
+  //       break;
+  //   }
+
+  //   double cpu_time_sec = temp_time[op] / 1e6;
+  //   double avg_latency_us = (double)temp_time[op] / temp_cnt[op];
+  //   double op_iops = temp_cnt[op] * 1e6 / temp_time[op];
+
+  //   printf(
+  //       "[%-6s] ops: %7lu, avg: %7.2f us, IOPS: %8.2f  (CPU time total: %4.1f
+  //       " "s)\n", opname, temp_cnt[op], avg_latency_us, op_iops,
+  //       cpu_time_sec);
+  // }
+
+  // printf(
+  //     "\nNote: total op time = thread-summed CPU time, may exceed "
+  //     "wall-clock\n");
+  // printf("********************************\n");
+
+  if (db && db->GetName() == "cache_migration_dpdk") {
+    auto *cmd = dynamic_cast<ycsbc::CacheMigrationDpdk *>(db);
+    if (cmd) {
+      cmd->StartDpdk();
+    } else {
+      std::cerr << "Error: DB name is 'cache_migration_dpdk' but "
+                   "dynamic_cast failed.\n";
     }
-
-    double cpu_time_sec = temp_time[op] / 1e6;
-    double avg_latency_us = (double)temp_time[op] / temp_cnt[op];
-    double op_iops = temp_cnt[op] * 1e6 / temp_time[op];
-
-    printf(
-        "[%-6s] ops: %7lu, avg: %7.2f us, IOPS: %8.2f  (CPU time total: %4.1f "
-        "s)\n",
-        opname, temp_cnt[op], avg_latency_us, op_iops, cpu_time_sec);
   }
-
-  printf(
-      "\nNote: total op time = thread-summed CPU time, may exceed "
-      "wall-clock\n");
-  printf("********************************\n");
 
   if (print_stats) {
     printf("-------------- db statistics --------------\n");
