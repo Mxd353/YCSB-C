@@ -1,182 +1,127 @@
 # AGENTS.md - YCSB-C Developer Guide
 
-This file provides guidelines for AI coding agents working on the YCSB-C project - a C++ implementation of the Yahoo! Cloud Serving Benchmark with DPDK support.
+YCSB-C is a C++ implementation of the Yahoo! Cloud Serving Benchmark with DPDK support for high-performance KV store testing.
 
-## Build System
+## Build Commands
 
-### Build Commands
 ```bash
-# Create build directory and configure
-cd /home/cc/Desktop/CacheMigration/YCSB-C
+# Build
 mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
-
-# Build the project
 make -j$(nproc)
-# Or use ninja if configured:
-# ninja
 
-# Clean build
+# Clean
 make clean
+
+# Debug build
+cmake .. -DCMAKE_BUILD_TYPE=Debug
 ```
 
-### Run Commands
+## Run Commands
+
 ```bash
-# Run with workload (requires sudo for DPDK)
-cd /home/cc/Desktop/CacheMigration/YCSB-C
+# Run workload (requires sudo for DPDK)
 sudo ./run_ycsbc.sh -T 2 -P workloads/workloada.spec
 
 # Direct execution
 sudo ./build/ycsbc -T 4 -P workloads/workloadb.spec
 
-# Available options:
-# -T <threadcount>  : Number of threads
-# -P <workloadfile>: Path to workload spec file
-# -db <dbname>      : Database name
-# -l                : Load phase (bool)
+# Options:
+#   -T <n>     : Number of threads
+#   -P <file>  : Workload spec file
+#   -db <name> : Database name (basic, cache_migration_dpdk)
+#   -l <bool>  : Load phase
 ```
 
-### Dependencies
-- **Compiler**: GCC 13+ (or $HOME/gcc)
-- **Boost**: $HOME/lib/boost or system package
-- **TBB**: $HOME/lib/tbb or libtbb-dev
-- **DPDK**: $HOME/lib/dpdk (required for cache_migration_dpdk)
-- **CMake**: 4.0+
+## Testing
 
-## Code Style Guidelines
+No formal unit test framework (no gtest/catch2). Testing is done by running benchmark workloads:
 
-### Language Standard
-- **C++17** (set in CMakeLists.txt)
-- No compiler extensions (`CMAKE_CXX_EXTENSIONS OFF`)
+```bash
+# Verify with basic workload
+./run_ycsbc.sh -T 1 -P workloads/workloada.spec
+tail ycsbc.output
 
-### Naming Conventions
+# Debugging (see run_ycsbc.sh for examples)
+sudo gdb --args ./build/ycsbc -T 1 -P workloads/workloada.spec
+sudo valgrind --leak-check=full ./build/ycsbc -T 1 -P workloads/workloada.spec
+```
 
-**Types & Classes**:
-- Classes: `CamelCase` (e.g., `CacheMigrationDpdk`, `CoreWorkload`)
-- Structs: `CamelCase` (e.g., `RequestInfo`, `KVRequest`)
-- Namespaces: lowercase (e.g., `ycsbc`, `utils`, `c_m_proto`)
+## Code Style
 
-**Variables**:
-- Member variables: trailing underscore (e.g., `name_`, `db_`, `workload_`)
-- Local variables: `snake_case` (e.g., `key`, `table`, `result`)
-- Constants: `k` prefix + PascalCase (e.g., `kOK`, `kErrorNoData`, `kFNVPrime64`)
-- Macros/defines: `ALL_CAPS` with underscores (e.g., `KEY_LENGTH`, `UDP_PORT_KV`)
-- Template parameters: `CamelCase` with descriptive names
+### Language
+- **C++17** standard
+- GCC 13+ with `-Wall -Wextra -Werror`
 
-**Functions**:
-- Methods: `CamelCase` (e.g., `DoInsert()`, `BuildRequestPacket()`)
-- Getters/Setters: `CamelCase` (e.g., `GetName()`, `SetName()`)
-- Inline utilities: `snake_case` or `CamelCase` (be consistent)
+### Naming
+| Type | Convention | Example |
+|------|------------|---------|
+| Classes/Structs | PascalCase | `CacheMigrationDpdk`, `RequestInfo` |
+| Namespaces | lowercase | `ycsbc`, `utils` |
+| Member variables | trailing underscore | `name_`, `db_` |
+| Local variables | snake_case | `key`, `result` |
+| Constants | k + PascalCase | `kOK`, `kErrorNoData` |
+| Macros | UPPER_CASE | `KEY_LENGTH`, `TX_NUM_MBUFS` |
+| Functions | PascalCase | `DoInsert()`, `GetName()` |
+
+### Formatting
+- **Indentation**: 2 spaces (no tabs)
+- **Line length**: ~100 characters
+- **Braces**: Same-line opening brace
+
+### Include Order
+```cpp
+#include "corresponding_header.h"   // 1. Corresponding header first
+#include <unistd.h>                  // 2. C system headers
+#include <vector>                    // 3. C++ STL
+#include <rte_mbuf.h>                // 4. Third-party libraries
+#include "core/db.h"                 // 5. Project headers
+```
 
 ### Include Guards
-Use header guards with project prefix:
 ```cpp
 #ifndef YCSB_C_FILENAME_H_
 #define YCSB_C_FILENAME_H_
 // ... content ...
 #endif  // YCSB_C_FILENAME_H_
 ```
-
-Or for newer headers:
-```cpp
-#pragma once
-```
-
-### Include Order
-1. Corresponding header file (for .cc files)
-2. C system headers (e.g., `<unistd.h>`)
-3. C++ standard library headers (e.g., `<vector>`, `<string>`)
-4. Third-party libraries (e.g., `<rte_ethdev.h>`, `<boost/...>`)
-5. Project headers using `"..."` (e.g., `"core/db.h"`)
-
-Example:
-```cpp
-#include "cache_migration_dpdk.h"  // Corresponding header first
-
-#include <algorithm>                // C++ STL
-#include <vector>
-
-#include <rte_mbuf.h>               // Third-party
-
-#include "core/db.h"                // Project headers
-#include "lib/c_m_proto.h"
-```
-
-### Code Formatting
-- **Indentation**: 2 spaces (no tabs)
-- **Line length**: ~80-100 characters
-- **Braces**: Same-line opening brace for functions and classes
-- **Comments**: Use `//` for single-line, `/* */` for file headers
+Or: `#pragma once`
 
 ### Error Handling
-
-**Use appropriate error mechanism for context**:
-
-1. **Return codes** for DB operations:
 ```cpp
+// Return codes for DB operations
 static const int kOK = 0;
 static const int kErrorNoData = 1;
-static const int kErrorConflict = 2;
+
+// Exceptions for fatal errors
+throw utils::Exception("Unknown operation");
+
+// DPDK logging
+RTE_LOG(ERR, PACKET, "Error message\n");
 ```
 
-2. **Exceptions** for fatal/config errors:
+### Constants & Memory
 ```cpp
-throw utils::Exception("Operation request is not recognized!");
-throw std::invalid_argument("total_ops must be greater than 0");
-```
-
-3. **DPDK logging** for network operations:
-```cpp
-RTE_LOG(ERR, PACKET, "No source IP available\n");
-RTE_LOG(WARNING, CORE, "Warning message\n");
-```
-
-4. **Standard error** for general diagnostics:
-```cpp
-std::cerr << "Error: Failed to initialize\n";
-```
-
-### Memory Management
-- Use `std::unique_ptr` for owned resources
-- Use `std::vector` for dynamic arrays
-- Use `std::atomic` for shared counters/flags
-- DPDK resources: Use `rte_pktmbuf_alloc()` / `rte_pktmbuf_free()`
-
-### Thread Safety
-- Use `thread_local` for per-thread state
-- Use `std::memory_order_relaxed` for counters where appropriate
-- Atomic operations for shared state:
-```cpp
-ops_cnt[op].fetch_add(1, std::memory_order_relaxed);
-```
-
-### Constants
-Prefer `constexpr` over `#define` where possible:
-```cpp
+// Prefer constexpr over #define
 constexpr size_t KEY_LENGTH = 16;
-constexpr uint16_t RETRIES = 5;
+
+// Use smart pointers and containers
+std::unique_ptr<Resource> ptr;
+std::vector<uint8_t> buffer;
+
+// Atomic operations
+std::atomic<uint64_t> counter;
+counter.fetch_add(1, std::memory_order_relaxed);
 ```
 
-Use `const` for values that don't need compile-time evaluation:
-```cpp
-const uint16_t TOTAL_LEN = ...;
-```
-
-### DPDK Specific Guidelines
-- Use `rte_be32_t` for network byte order IP addresses
-- Use `rte_cpu_to_be_16()` / `rte_be_to_cpu_16()` for conversions
-- Check pointer returns from `rte_pktmbuf_alloc()`
-- Use `RTE_ETHER_ADDR_COPY` macros for address operations
-
-### File Headers
-Include standard file header:
+### File Header
 ```cpp
 //
 //  filename.h
 //  YCSB-C
 //
-//  Created by Author Name on MM/DD/YY.
-//  Copyright (c) YYYY Author Name <email>.
+//  Created by Author on MM/DD/YY.
+//  Copyright (c) YYYY Author <email>.
 //
 ```
 
@@ -184,35 +129,27 @@ Include standard file header:
 
 ```
 YCSB-C/
-├── core/           # Core framework (workload generators, client)
-├── db/             # Database implementations (basic_db, cache_migration_dpdk)
-├── lib/            # Shared libraries (protocol, consistent_hash, request_map)
-├── workloads/      # Workload specification files (*.spec)
-├── conf/           # Configuration files
-├── build/          # Build output directory
-├── CMakeLists.txt  # CMake configuration
-└── ycsbc.cc        # Main entry point
+├── core/       # Workload generators, client framework
+├── db/         # Database implementations (basic_db, cache_migration_dpdk)
+├── lib/        # Shared libraries (protocol, hash, request_map)
+├── workloads/  # Workload specification files (*.spec)
+├── conf/       # Configuration files
+├── build/      # Build output directory
+├── CMakeLists.txt
+└── ycsbc.cc    # Main entry point
 ```
 
-## Testing
+## Dependencies
 
-**Note**: This project does not use a formal test framework. Testing is done via:
-1. Running workloads against the benchmark
-2. Manual verification of output
-3. DPDK packet capture and analysis
-
-To verify changes:
-```bash
-# Build and run basic workload
-./run_ycsbc.sh -T 1 -P workloads/workloada.spec
-
-# Check output
-tail ycsbc.output
-```
+- **Compiler**: GCC 13+ (or `$HOME/gcc`)
+- **Boost**: `$HOME/lib/boost` or system package
+- **TBB**: `$HOME/lib/tbb` or libtbb-dev
+- **DPDK**: `$HOME/lib/dpdk` (required for cache_migration_dpdk)
+- **CMake**: 4.0+
 
 ## Common Patterns
 
-**RAII for DPDK cleanup**:
+**RAII for cleanup**:
 ```cpp
 struct DBCleaner {
   ycsbc::DB *db;
@@ -220,13 +157,8 @@ struct DBCleaner {
 } cleaner{db};
 ```
 
-**Atomic counters**:
+**DPDK network types**:
 ```cpp
-std::atomic<uint64_t> ops_cnt[ycsbc::Operation::READMODIFYWRITE + 1];
-ops_cnt[op].fetch_add(1, std::memory_order_relaxed);
-```
-
-**Protocol encoding**:
-```cpp
-kv_request->dev_info = static_cast<uint8_t>(ENCODE_DEV_INFO(dev_id, DEV_CLIENT));
+rte_be32_t ip_addr;
+uint16_t port = rte_cpu_to_be_16(UDP_PORT_KV);
 ```

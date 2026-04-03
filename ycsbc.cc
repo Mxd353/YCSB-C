@@ -45,7 +45,7 @@ int DelegateClient(ycsbc::DB *db, ycsbc::CoreWorkload *wl, const int num_ops,
   ycsbc::Client client(*db, *wl);
   int oks = 0;
 
-  for (auto i : utils::range(num_ops)) {
+  for (int i = 0; i < num_ops; i++) {
     oks += is_loading ? client.DoInsert() : client.DoTransaction();
   }
 
