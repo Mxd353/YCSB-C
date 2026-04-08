@@ -122,6 +122,10 @@ class CacheMigrationDpdk : public DB {
 
   CacheMigrationDpdk(utils::Properties& props);
   ~CacheMigrationDpdk();
+  
+  // Configuration: use high-performance pipeline mode
+  // Pipeline mode: build packets on-the-fly, no pre-built templates
+  // Traditional mode: pre-build packet templates and reuse
   void AllocateSpace(size_t total_ops, size_t req_size) override;
   void Init(const int thread_id) override;
   void Close() override;
@@ -185,6 +189,9 @@ class CacheMigrationDpdk : public DB {
   // Pre-generated key templates for fast packet construction
   std::vector<KeyTemplate> key_templates_;
   size_t num_key_templates_ = 0;
+  
+  // Configuration
+  bool use_pipeline_ = false;  // Use high-performance pipeline mode
 
   inline void AssignCores();
   int PortInit(uint16_t port);
@@ -209,8 +216,9 @@ class CacheMigrationDpdk : public DB {
   static inline int RxMain(void* arg);
   static inline int TxMain(void* arg);
 
-  // Optimized TxMain for pipeline mode (member function for access to instance vars)
-  inline int TxMainPipeline(void* arg);
+  // Optimized TxMain for pipeline mode
+  // Static member function with instance pointer in TxConf
+  static inline int TxMainPipeline(void* arg);
 };
 }  // namespace ycsbc
 

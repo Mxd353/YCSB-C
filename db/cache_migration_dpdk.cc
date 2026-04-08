@@ -65,7 +65,8 @@ thread_local CacheMigrationDpdk::ThreadStats thread_stats;
 
 CacheMigrationDpdk::CacheMigrationDpdk(utils::Properties& props)
     : num_threads_(std::stoi(props.GetProperty("threadcount", "1"))),
-      consistent_hash_("conf/server_ips.conf") {
+      consistent_hash_("conf/server_ips.conf"),
+      use_pipeline_(props.GetProperty("use_pipeline", "false") == "true") {
   std::vector<std::string> args;
   std::string dpdk_conf = "conf/dpdk.conf";
   std::ifstream dpdk_file(dpdk_conf);
@@ -691,6 +692,14 @@ inline int CacheMigrationDpdk::TxMain(void* arg) {
 }
 
 inline void CacheMigrationDpdk::LaunchThreads() {
+  // Print mode info
+  if (use_pipeline_) {
+    std::cout << "[Pipeline Mode] High-performance on-the-fly packet construction"
+              << std::endl;
+  } else {
+    std::cout << "[Traditional Mode] Pre-built packet templates" << std::endl;
+  }
+
   rx_args_.clear();
   for (auto& core : rx_cores_) {
     try {
@@ -727,13 +736,23 @@ inline void CacheMigrationDpdk::LaunchThreads() {
     auto tx_conf = std::make_unique<TxConf>();
     tx_conf->lcore_id = lcore_id;
     tx_conf->queue_id = queue_id;
+    tx_conf->instance = this;  // Required for pipeline mode
 
     size_t length = per_core + (i < remainder ? 1 : 0);
     tx_conf->interval = {offset, offset + length};
     offset += length;
 
     tx_args_.push_back(std::move(tx_conf));
-    int ret = rte_eal_remote_launch(TxMain, tx_args_.back().get(), lcore_id);
+    
+    // Choose between traditional mode and pipeline mode
+    int ret;
+    if (use_pipeline_) {
+      ret = rte_eal_remote_launch(
+          reinterpret_cast<lcore_function_t*>(TxMainPipeline),
+          tx_args_.back().get(), lcore_id);
+    } else {
+      ret = rte_eal_remote_launch(TxMain, tx_args_.back().get(), lcore_id);
+    }
     if (ret < 0) {
       std::cerr << "Failed to launch TX thread on core " << lcore_id
                 << ", error: " << rte_strerror(-ret) << std::endl;
@@ -895,9 +914,7 @@ void CacheMigrationDpdk::PrintStats() {
 
 // ==================== High Performance Pipeline Mode ====================
 // 边构造边发送的高性能实现，目标1MQPS
-
-// Forward declaration for pipeline mode
-inline int TxMainPipelineWrapper(void* arg);
+// Static member function - can be used directly with rte_eal_remote_launch
 
 inline int CacheMigrationDpdk::TxMainPipeline(void* arg) {
   TxConf* ctx = static_cast<TxConf*>(arg);
@@ -1040,17 +1057,6 @@ inline int CacheMigrationDpdk::TxMainPipeline(void* arg) {
   // 启动超时监控
   RunTimeoutMonitor(arg);
   return 0;
-}
-
-// Wrapper for rte_eal_remote_launch - calls the member function
-inline int TxMainPipelineWrapper(void* arg) {
-  TxConf* ctx = static_cast<TxConf*>(arg);
-  if (!ctx || !ctx->instance) {
-    std::cerr << "Error: Invalid TxConf in wrapper!" << std::endl;
-    return -1;
-  }
-  // Call the member function through the instance pointer
-  return ctx->instance->TxMainPipeline(arg);
 }
 
 }  // namespace ycsbc
