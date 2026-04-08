@@ -4,7 +4,6 @@
 #include <rte_mbuf.h>
 
 #include <atomic>
-#include <future>
 #include <memory>
 #include <vector>
 
@@ -12,7 +11,6 @@
 #include "core/properties.h"
 #include "lib/c_m_proto.h"
 #include "lib/consistent_hash.h"
-#include "lib/request_map.h"
 
 // TX_NUM_MBUFS: Maximum packet templates that can be built
 // Actual packets built = min(operationcount, TX_NUM_MBUFS)
@@ -26,7 +24,7 @@
 #define TX_RING_SIZE 4096
 #define TX_RING_COUNT 32
 #define BURST_SIZE 32
-#define REQ_SIZE 100'000'000
+#define REQ_SIZE 100'000'000.0
 
 #define RTE_LOGTYPE_CORE RTE_LOGTYPE_USER3
 #define RTE_LOGTYPE_PACKET RTE_LOGTYPE_USER4
@@ -34,21 +32,20 @@
 extern std::atomic<bool> running;
 
 struct RequestInfo {
-  uint64_t start_time = 0;
+  std::atomic<uint64_t> start_time{0};
 
-  std::atomic<int> retry_count;
-  std::atomic<bool> completed;
-  std::atomic<bool> time_out;
+  std::atomic<int> retry_count{0};
+  std::atomic<bool> completed{false};
+  std::atomic<bool> time_out{false};
 
-  RequestInfo() : retry_count(0), completed(false), time_out(false) {}
+  RequestInfo() = default;
 
   RequestInfo(RequestInfo&& other) noexcept
-      : start_time(other.start_time),
+      : start_time(other.start_time.load(std::memory_order_relaxed)),
         retry_count(other.retry_count.load(std::memory_order_relaxed)),
         completed(other.completed.load(std::memory_order_relaxed)),
         time_out(other.time_out.load(std::memory_order_relaxed)) {
-    other.start_time = 0;
-
+    other.start_time.store(0, std::memory_order_relaxed);
     other.retry_count.store(0, std::memory_order_relaxed);
     other.completed.store(false, std::memory_order_relaxed);
     other.time_out.store(false, std::memory_order_relaxed);
@@ -56,14 +53,16 @@ struct RequestInfo {
 
   RequestInfo& operator=(RequestInfo&& other) noexcept {
     if (this != &other) {
-      start_time = other.start_time;
+      start_time.store(other.start_time.load(std::memory_order_relaxed),
+                       std::memory_order_relaxed);
+      retry_count.store(other.retry_count.load(std::memory_order_relaxed),
+                        std::memory_order_relaxed);
+      completed.store(other.completed.load(std::memory_order_relaxed),
+                      std::memory_order_relaxed);
+      time_out.store(other.time_out.load(std::memory_order_relaxed),
+                     std::memory_order_relaxed);
 
-      retry_count.store(other.retry_count.load(std::memory_order_relaxed));
-      completed.store(other.completed.load(std::memory_order_relaxed));
-      time_out.store(other.time_out.load(std::memory_order_relaxed));
-
-      other.start_time = 0;
-
+      other.start_time.store(0, std::memory_order_relaxed);
       other.retry_count.store(0, std::memory_order_relaxed);
       other.completed.store(false, std::memory_order_relaxed);
       other.time_out.store(false, std::memory_order_relaxed);
@@ -72,10 +71,10 @@ struct RequestInfo {
   }
 
   void clear() {
-    start_time = 0;
-
+    start_time.store(0, std::memory_order_relaxed);
     retry_count.store(0, std::memory_order_relaxed);
     completed.store(false, std::memory_order_relaxed);
+    time_out.store(false, std::memory_order_relaxed);
   }
 
   RequestInfo(const RequestInfo&) = delete;
@@ -91,6 +90,12 @@ struct TxConf {
 struct RxConf {
   uint lcore_id;
   uint16_t queue_id = 0;
+};
+
+struct TimeoutConf {
+  uint lcore_id;
+  uint16_t queue_id = 0;
+  std::pair<size_t, size_t> interval{0, 0};
 };
 
 namespace ycsbc {
@@ -142,6 +147,7 @@ class CacheMigrationDpdk : public DB {
 
   std::vector<TxConf> tx_cores_;
   std::vector<RxConf> rx_cores_;
+  std::vector<TimeoutConf> timeout_cores_;
 
   struct RxArgs {
     uint16_t queue_id;
@@ -150,6 +156,7 @@ class CacheMigrationDpdk : public DB {
 
   std::vector<std::unique_ptr<RxArgs>> rx_args_;
   std::vector<std::unique_ptr<TxConf>> tx_args_;
+  std::vector<std::unique_ptr<TimeoutConf>> timeout_args_;
 
   struct DevInfo {
     rte_be32_t src_ip;
@@ -161,15 +168,15 @@ class CacheMigrationDpdk : public DB {
   inline void AssignCores();
   int PortInit(uint16_t port);
   inline void LaunchThreads();
-  rte_mbuf* BuildRequestPacket(const std::string& key, uint8_t op,
-                               uint32_t req_id,
-                               const std::vector<KVPair>& values);
 
-  static inline int RunTimeoutMonitor(void* arg);
   void DoRx(uint16_t queue_id);
 
   static inline int RxMain(void* arg);
   static inline int TxMain(void* arg);
+  static inline int RunTimeoutMonitor(void* arg);
+
+  rte_mbuf* BuildRequestPacket(const std::string& key, uint8_t op,
+                               const std::vector<KVPair>& values);
 };
 }  // namespace ycsbc
 

@@ -1,16 +1,11 @@
 #include "cache_migration_dpdk.h"
 
 #include <algorithm>
-#include <bitset>
-#include <chrono>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <random>
 #include <sstream>
-#include <thread>
 
-#include "core/core_workload.h"
 #include "core/timer.h"
 #include "core/utils.h"
 
@@ -21,8 +16,6 @@ extern char* __progname;
 
 static std::vector<RequestInfo> requests;
 static std::vector<rte_mbuf*> packets;
-
-// std::atomic<uint32_t> utils::RequestIDGenerator::counter{0};
 
 uint64_t send_start_us = 0;
 uint64_t use_time_us = 0;
@@ -36,15 +29,20 @@ std::atomic<size_t> timeout_send{0};
 std::atomic<size_t> false_count{0};
 
 std::atomic<size_t> read_count{0};
-// std::atomic<size_t> read_success{0};
 std::atomic<size_t> update_count{0};
-// std::atomic<size_t> update_success{0};
 
-static inline void exponentialBackoff(int attempt) {
-  int wait_ms = std::min(20 * (1 << (attempt - 1)), 500);
-  std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
-}
+namespace ycsbc {
 
+thread_local rte_be32_t CacheMigrationDpdk::src_ip_ = 0;
+thread_local uint16_t CacheMigrationDpdk::dev_id_ = 0;
+thread_local int CacheMigrationDpdk::thread_id_ = 0;
+thread_local CacheMigrationDpdk::ThreadStats thread_stats;
+
+// ============================================================================
+// 第1组：静态辅助函数（工具函数）
+// ============================================================================
+
+// 根据重试次数计算超时时间（微秒），使用指数退避策略
 static inline uint64_t time_out_us(int retry_count) {
   constexpr uint64_t BASE_TIMEOUT_US = 20'000;
   constexpr uint64_t MAX_TIMEOUT_US = 500'000;
@@ -57,12 +55,11 @@ static inline uint64_t time_out_us(int retry_count) {
   return std::min(exponential_backoff, MAX_TIMEOUT_US);
 }
 
-namespace ycsbc {
-thread_local rte_be32_t CacheMigrationDpdk::src_ip_ = 0;
-thread_local uint16_t CacheMigrationDpdk::dev_id_ = 0;
-thread_local int CacheMigrationDpdk::thread_id_ = 0;
-thread_local CacheMigrationDpdk::ThreadStats thread_stats;
+// ============================================================================
+// 第2组：构造函数/析构函数（对象生命周期管理）
+// ============================================================================
 
+// 构造函数 - 初始化DPDK环境、内存池和网络端口
 CacheMigrationDpdk::CacheMigrationDpdk(utils::Properties& props)
     : num_threads_(std::stoi(props.GetProperty("threadcount", "1"))),
       consistent_hash_("conf/server_ips.conf") {
@@ -75,10 +72,6 @@ CacheMigrationDpdk::CacheMigrationDpdk(utils::Properties& props)
 
   char* program_name = __progname;
   args.push_back(program_name);
-
-  // 动态核数
-  //  args.push_back("-l");
-  //  args.push_back("0-" + std::to_string(num_threads));
 
   while (dpdk_file >> token) {
     args.push_back(token);
@@ -131,6 +124,7 @@ CacheMigrationDpdk::CacheMigrationDpdk(utils::Properties& props)
   if (rx_mbufpool_ == NULL)
     rte_exit(EXIT_FAILURE, "Cannot create RX_MBUF_POOL\n");
 
+  // 分配核心并初始化端口
   AssignCores();
 
   uint16_t port = 0;
@@ -146,6 +140,7 @@ CacheMigrationDpdk::CacheMigrationDpdk(utils::Properties& props)
   std::cout << "+++++++++++++++++++++++++++++++++\n";
 }
 
+// 析构函数 - 清理DPDK资源，停止端口，释放内存池
 CacheMigrationDpdk::~CacheMigrationDpdk() {
   running = false;
   rte_eal_mp_wait_lcore();
@@ -177,14 +172,15 @@ CacheMigrationDpdk::~CacheMigrationDpdk() {
   std::cout << "CacheMigrationDpdk resources cleaned up." << std::endl;
 }
 
+// ============================================================================
+// 第3组：DB接口实现（YCSB标准接口）
+// ============================================================================
+
+// 为请求分配空间并重置统计计数器
 void CacheMigrationDpdk::AllocateSpace(size_t total_ops, size_t req_size) {
   if (total_ops == 0) {
     throw std::invalid_argument("total_ops must be greater than 0");
   }
-
-  // Note: total_ops = number of packet templates to build (limited by TX_NUM_MBUFS)
-  //       req_size = total number of requests to send (can be much larger)
-  // The packet templates are reused cyclically to send all requests
 
   total_latency_us.store(0, std::memory_order_relaxed);
   completed_count.store(0, std::memory_order_relaxed);
@@ -209,9 +205,10 @@ void CacheMigrationDpdk::AllocateSpace(size_t total_ops, size_t req_size) {
     pkt = nullptr;
   }
   packets.clear();
-  packets.reserve(total_ops);  // Only build 'total_ops' packet templates
+  packets.reserve(total_ops);
 }
 
+// 初始化线程本地状态，设置源IP和设备ID
 void CacheMigrationDpdk::Init(const int thread_id) {
   static thread_local bool initialized = false;
   if (initialized) return;
@@ -225,43 +222,72 @@ void CacheMigrationDpdk::Init(const int thread_id) {
   initialized = true;
 }
 
+// 关闭数据库连接
 void CacheMigrationDpdk::Close() {}
 
-void CacheMigrationDpdk::StartDpdk() {
-  for (auto& req : requests) {
-    if (req.completed.load(std::memory_order_acquire)) {
-      rte_exit(EXIT_FAILURE, "Have not completed!");
-    }
+// 构建并入队读请求数据包
+int CacheMigrationDpdk::Read(const std::string& /*table*/,
+                             const std::string& key,
+                             const std::vector<std::string>* /*fields*/,
+                             std::vector<KVPair>& /*result*/) {
+  rte_mbuf* mbuf = BuildRequestPacket(key, READ_REQUEST, DEFAULT_VALUES);
+  if (!mbuf) {
+    false_count.fetch_add(1, std::memory_order_relaxed);
+    std::cerr << "[Read] Fail to creat mbuf for: " << key << std::endl;
+    return DB::kErrorNoData;
   }
 
-  for (auto pkt : packets) {
-    if (!pkt) {
-      rte_exit(EXIT_FAILURE, "Have mbuf is nullptr!");
-    }
-  }
+  packets.push_back(mbuf);
 
-  std::cerr << "All " << requests.size() << " requests valid." << std::endl;
-
-  running = true;
-
-  std::cerr << "start DPDK.." << std::endl;
-  LaunchThreads();
-
-  while (completed_count + timeout_count + false_count < total_request_count) {
-    rte_delay_us_sleep(1'000);
-  }
-
-  use_time_us = get_now_micros() - send_start_us;
-  running = false;
-
-  std::cerr << "All requests completed or timed out." << std::endl;
+  return DB::kOK;
 }
 
-size_t CalculateRXCores(size_t total) {
-  if (total <= 1) return 1;
-  return (total * 2) / 3;
+// 构建并入队插入请求数据包
+int CacheMigrationDpdk::Insert(const std::string& /*table*/,
+                               const std::string& key,
+                               std::vector<KVPair>& values) {
+  rte_mbuf* mbuf = BuildRequestPacket(key, WRITE_REQUEST, values);
+  if (!mbuf) {
+    false_count.fetch_add(1, std::memory_order_relaxed);
+    std::cerr << "[Insert] Fail to creat mbuf for: " << key << std::endl;
+    return DB::kErrorNoData;
+  }
+
+  packets.push_back(mbuf);
+
+  return DB::kOK;
 }
 
+// 将更新操作委托给Insert处理
+int CacheMigrationDpdk::Update(const std::string& table, const std::string& key,
+                               std::vector<KVPair>& values) {
+  return Insert(table, key, values);
+}
+
+// 扫描操作（未实现）
+int CacheMigrationDpdk::Scan(const std::string& /*table*/,
+                             const std::string& /*key*/, int /*record_count*/,
+                             const std::vector<std::string>* /*fields*/,
+                             std::vector<std::vector<KVPair>>& /*result*/) {
+  return DB::kOK;
+}
+
+// 将删除操作委托给Update处理，使用默认值
+int CacheMigrationDpdk::Delete(const std::string& table,
+                               const std::string& key) {
+  return Update(table, key, DEFAULT_VALUES);
+}
+
+// ============================================================================
+// 第4组：初始化相关（核心分配和端口初始化）
+// ============================================================================
+
+// 根据总可用核心数按照 2:1:1 比例分配 RX、TX 和超时监控核心
+// 要求：总核心数 >= 4
+// 分配规则：RX = total/2, TX = total/4, Timeout = total/4
+// 剩余核心分配给 RX
+// TX队列分配：前 tx_count 个队列给 TX 线程，后 timeout_count 个队列给 Timeout
+// 线程（独立队列）
 inline void CacheMigrationDpdk::AssignCores() {
   uint lcore_id;
   std::vector<uint> workers;
@@ -269,42 +295,58 @@ inline void CacheMigrationDpdk::AssignCores() {
   RTE_LCORE_FOREACH_WORKER(lcore_id) { workers.push_back(lcore_id); }
 
   size_t total_workers = workers.size();
-  if (total_workers < 3) {
+  if (total_workers < 4) {
     rte_exit(EXIT_FAILURE,
-             "Need at least 3 worker cores (got %zu): RX, TX, and "
-             "TimeoutMonitorThread\n",
+             "Need at least 4 worker cores (got %zu): RX=total/2, TX=total/4, "
+             "Timeout=total/4\n",
              total_workers);
   }
 
-  size_t rx_count = CalculateRXCores(total_workers);
-  size_t tx_count = total_workers - rx_count;
+  // 核心分配比例: RX=1/2, TX=1/4, Timeout=1/4
+  size_t rx_count = total_workers / 2;
+  size_t tx_count = total_workers / 4;
+  size_t timeout_count = total_workers / 4;
 
-  if (tx_count == 0 && total_workers > 1) {
-    rx_count--;
-    tx_count = 1;
-  }
+  // 处理剩余核心（当 total_workers 不是 4 的倍数时）
+  // 剩余核心分配给 RX，因为 RX 处理压力最大
+  size_t remainder = total_workers - (rx_count + tx_count + timeout_count);
+  rx_count += remainder;
 
   rx_cores_.reserve(rx_count);
   tx_cores_.reserve(tx_count);
+  timeout_cores_.reserve(timeout_count);
 
-  for (auto i : range(rx_count)) {
-    rx_cores_.emplace_back(RxConf{workers[i], 0});
+  size_t idx = 0;
+  for ([[maybe_unused]] auto i : range(rx_count)) {
+    rx_cores_.emplace_back(RxConf{workers[idx++], 0});
   }
 
-  for (auto i : range(rx_count, rx_count + tx_count)) {
-    tx_cores_.emplace_back(TxConf{workers[i]});
+  for ([[maybe_unused]] auto i : range(tx_count)) {
+    tx_cores_.emplace_back(TxConf{workers[idx++]});
   }
 
-  printf("Assigned %zu RX cores, %zu TX cores\n", rx_cores_.size(),
-         tx_cores_.size());
+  for ([[maybe_unused]] auto i : range(timeout_count)) {
+    // Timeout线程使用独立的TX队列，队列ID从tx_count开始
+    uint16_t queue_id = tx_count + i;
+    timeout_cores_.emplace_back(TimeoutConf{workers[idx++], queue_id});
+  }
+
+  printf(
+      "Assigned %zu RX cores (50%%), %zu TX cores (25%%), "
+      "%zu Timeout cores (25%%), total %zu TX queues\n",
+      rx_cores_.size(), tx_cores_.size(), timeout_cores_.size(),
+      tx_cores_.size() + timeout_cores_.size());
 }
 
+// 初始化以太网端口，配置RSS和硬件卸载功能
 int CacheMigrationDpdk::PortInit(uint16_t port) {
   uint16_t nb_rxd = RX_RING_SIZE;
   uint16_t nb_txd = TX_RING_SIZE;
 
   uint16_t nb_rx_cores = rx_cores_.size();
-  uint16_t nb_tx_cores = tx_cores_.size();
+  uint16_t nb_tx_cores =
+      tx_cores_.size() +
+      timeout_cores_.size();  // TX队列 = TX核心数 + Timeout核心数
 
   if (tx_mbufpool_ == NULL || rx_mbufpool_ == NULL)
     rte_exit(EXIT_FAILURE, "mbuf_pool is NULL!\n");
@@ -343,10 +385,30 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
   if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_UDP_CKSUM)
     port_conf.txmode.offloads |= RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
 
-  // 确保关闭
-  // MBUF_FAST_FREE，因为我们需要在发送后修改数据包（如重发时更新request_id）
   if (dev_info.tx_offload_capa & RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE)
     port_conf.txmode.offloads &= ~RTE_ETH_TX_OFFLOAD_MBUF_FAST_FREE;
+
+  // 检查网卡是否支持所需的队列数
+  if (nb_rx_cores > dev_info.max_rx_queues) {
+    rte_exit(EXIT_FAILURE,
+             "Error: Requested %u RX queues exceed hardware limit %u. "
+             "Please reduce RX cores or use a NIC with more RX queues.\n",
+             nb_rx_cores, dev_info.max_rx_queues);
+  }
+  if (nb_tx_cores > dev_info.max_tx_queues) {
+    rte_exit(EXIT_FAILURE,
+             "Error: Requested %u TX queues (TX=%zu + Timeout=%zu) exceed "
+             "hardware limit %u. Please reduce worker cores or use a NIC "
+             "with more TX queues.\n",
+             nb_tx_cores, tx_cores_.size(), timeout_cores_.size(),
+             dev_info.max_tx_queues);
+  }
+
+  RTE_LOG(NOTICE, EAL,
+          "Hardware supports: max_rx_queues=%u, max_tx_queues=%u\n",
+          dev_info.max_rx_queues, dev_info.max_tx_queues);
+  RTE_LOG(NOTICE, EAL, "Requesting: rx_queues=%u, tx_queues=%u\n", nb_rx_cores,
+          nb_tx_cores);
 
   port_conf.rx_adv_conf.rss_conf.rss_hf &= dev_info.flow_type_rss_offloads;
   if (port_conf.rx_adv_conf.rss_conf.rss_hf !=
@@ -375,20 +437,35 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
     rx_cores_[q].queue_id = q;
   }
 
-  uint16_t max_supported_tx_queues = dev_info.max_tx_queues;
-  RTE_LOG(NOTICE, EAL, "max_supported_tx_queues: %u\n",
-          max_supported_tx_queues);
-
   rte_eth_txconf txconf = dev_info.default_txconf;
   txconf.offloads = port_conf.txmode.offloads;
 
-  for (auto q : range(nb_tx_cores)) {
+  // 为TX核心创建TX队列（队列ID 0 ~ tx_count-1）
+  for (auto q : range(tx_cores_.size())) {
     retval = rte_eth_tx_queue_setup(port, q, nb_txd,
                                     rte_eth_dev_socket_id(port), &txconf);
     if (retval < 0) rte_exit(EXIT_FAILURE, "Cannot setup TX queue\n");
 
     tx_cores_[q].queue_id = q;
   }
+
+  // 为Timeout监控核心创建独立的TX队列（队列ID tx_count ~
+  // tx_count+timeout_count-1）
+  for (auto q : range(timeout_cores_.size())) {
+    uint16_t queue_id = tx_cores_.size() + q;
+    retval = rte_eth_tx_queue_setup(port, queue_id, nb_txd,
+                                    rte_eth_dev_socket_id(port), &txconf);
+    if (retval < 0) {
+      RTE_LOG(ERR, EAL, "Cannot setup Timeout TX queue %u\n", queue_id);
+      rte_exit(EXIT_FAILURE, "Cannot setup Timeout TX queue\n");
+    }
+    // queue_id已经在AssignCores中设置到timeout_cores_
+  }
+
+  RTE_LOG(
+      NOTICE, EAL,
+      "Setup %zu TX queues for TX threads, %zu TX queues for Timeout threads\n",
+      tx_cores_.size(), timeout_cores_.size());
 
   retval = rte_eth_promiscuous_enable(port);
   if (retval != 0) rte_exit(EXIT_FAILURE, "Cannot set promiscuous\n");
@@ -402,294 +479,42 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
   return 0;
 }
 
-/**
- * @brief 超时监控函数，负责检查请求是否超时并处理超时请求
- * @param arg 包含发送配置信息的参数
- * @return 0 表示正常退出
- *
- * 该函数在指定的核心上运行，持续监控指定范围内的请求，
- * 检查是否有请求超时，并对超时的请求进行重试或标记为失败。
- * 实现了指数退避的超时重试机制。
- */
-inline int CacheMigrationDpdk::RunTimeoutMonitor(void* arg) {
-  // 解析参数，获取发送配置信息
-  TxConf* ctx = static_cast<TxConf*>(arg);
-  uint16_t queue_id = ctx->queue_id;   // 获取队列ID
-  size_t start = ctx->interval.first;  // 起始请求ID
-  size_t end = ctx->interval.second;   // 结束请求ID
+// ============================================================================
+// 第5组：核心运行逻辑（线程函数）
+// ============================================================================
 
-  // 定义睡眠间隔时间（微秒）
-  constexpr uint64_t kSleepIntervalUs = 1000;
-  // 最大重试次数限制
-  const uint16_t kMaxRetries = RETRIES;
-  // 批处理大小，将请求分批处理以提高效率
-  size_t kBatchSize = (end - start) / 10;
-
-  // 获取数据包总数
-  size_t total_packets = packets.size();
-
-  // 可选调试输出
-  // std::cerr << "Start Timeout Monitor on lcore: " << rte_lcore_id()
-  //           << std::endl;
-
-  // 主循环：持续监控直到系统停止运行
-  while (running.load(std::memory_order_acquire)) {
-    // 将请求范围分批处理，避免单次处理过多请求
-    for (auto i : range(start, end, kBatchSize)) {
-      // 计算当前批次的结束位置
-      size_t batch_end = std::min(i + kBatchSize, end);
-      // 获取当前时间戳
-      uint64_t now = get_now_micros();
-
-      // 遍历当前批次中的每个请求
-      for (auto request_id : range(i, batch_end)) {
-        // 获取请求信息的引用
-        RequestInfo& req = requests[request_id];
-
-        // 跳过已完成或已超时的请求
-        if (req.completed.load() || req.time_out.load()) continue;
-
-        // 计算已用时间
-        uint64_t elapsed_time =
-            (now >= req.start_time) ? (now - req.start_time) : 0;
-
-        // 获取当前重试次数
-        int current_retry_count =
-            req.retry_count.load(std::memory_order_acquire);
-
-        // 计算预期超时时间（根据重试次数动态调整）
-        uint64_t expected_timeout = time_out_us(current_retry_count);
-        // 如果未超时，跳过此请求
-        if (elapsed_time < expected_timeout) continue;
-
-        // 检查是否超过最大重试次数
-        if (current_retry_count > kMaxRetries) {
-          // 原子操作标记请求为超时状态
-          if (req.time_out.exchange(true)) continue;
-          // 更新超时计数
-          timeout_count.fetch_add(1, std::memory_order_relaxed);
-          continue;
-        }
-
-        // 计算数据包索引（使用取模运算循环使用数据包）
-        size_t packet_index = request_id % total_packets;
-        if (packet_index >= packets.size()) {
-          std::cerr
-              << "Error: Attempt to access an out-of-bounds packet index: "
-              << packet_index << " limit: " << packets.size() << std::endl;
-          continue;
-        }
-        // 获取要重发的数据包
-        rte_mbuf* packet = packets[packet_index];
-
-        // 检查数据包有效性并尝试重新发送
-        if (packet && !req.completed.load()) {
-          // 发送数据包
-          int sent = rte_eth_tx_burst(0, queue_id, &packet, 1);
-          if (sent == 1) {
-            // 重发成功，更新统计信息
-            // std::cerr << "Time out send" << std::endl;
-            timeout_send.fetch_add(1,
-                                   std::memory_order_relaxed);  // 增加重发计数
-            req.retry_count.fetch_add(
-                1, std::memory_order_relaxed);  // 增加重试次数
-            req.start_time = now;               // 重置开始时间为当前时间
-          }
-        }
-      }
-      // 每处理完一批次后短暂休眠，避免过度占用CPU
-      rte_delay_us_block(kSleepIntervalUs);
-    }
-  }
-  return 0;
-}
-
-/**
- * @brief 处理网络接收操作的函数
- * @param queue_id 要处理的接收队列ID
- *
- * 该函数在指定的核心上运行，负责从网络接口接收数据包，
- * 处理接收到的响应，并标记相应的请求为已完成状态。
- */
-void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
-  // 获取当前核心ID
-  uint lcore_id = rte_lcore_id();
-
-  // 检查核心ID是否有效
-  if (lcore_id == RTE_MAX_LCORE || lcore_id == (unsigned)LCORE_ID_ANY) {
-    printf("Invalid lcore_id = %u\n", lcore_id);
-    return;
-  }
-
-  // 检查核心是否启用且不是主核心
-  if (rte_lcore_is_enabled(lcore_id) && lcore_id != rte_get_main_lcore()) {
-    uint16_t port = 0;  // 网络端口号
-    uint16_t nb_rx;     // 接收到的数据包数量
-
-    // 检查端口是否在远程NUMA节点上，可能影响性能
-    if (rte_eth_dev_socket_id(port) >= 0 &&
-        rte_eth_dev_socket_id(port) != (int)rte_socket_id())
-      printf(
-          "WARNING, port %u is on remote NUMA node to "
-          "polling thread.\n\tPerformance will "
-          "not be optimal.\n",
-          port);
-
-    // 记录核心正在轮询的队列信息
-    RTE_LOG(NOTICE, CORE, "[RX] %u polling queue: %hu\n", lcore_id, queue_id);
-
-    // 用于存储接收到的数据包的缓冲区
-    rte_mbuf* bufs[BURST_SIZE];
-
-    // 主循环：持续接收数据包直到系统停止运行
-    while (running.load(std::memory_order_acquire)) {
-      // 从网络端口批量接收数据包
-      nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
-
-      // 如果没有接收到数据包，继续轮询
-      if (unlikely(nb_rx == 0)) {
-        continue;
-      } else {
-        // 更新完成的请求计数
-        completed_count.fetch_add(nb_rx, std::memory_order_relaxed);
-
-        // 处理每个接收到的数据包
-        for (auto i : range(nb_rx)) {
-          // 从数据包中提取KV请求头部
-          KVRequest* kv_header =
-              rte_pktmbuf_mtod_offset(bufs[i], KVRequest*, KV_HEADER_OFFSET);
-
-          // 标记对应的请求为已完成状态
-          requests[rte_be_to_cpu_32(kv_header->request_id)].completed.exchange(
-              true);
-
-          // 释放数据包内存
-          rte_pktmbuf_free(bufs[i]);
-        }
-      }
-    }
-  } else {
-    // 跳过主核心，避免干扰主核心的工作
-    printf("Skip main lcore %u\n", lcore_id);
-  }
-  return;
-}
-
-inline int CacheMigrationDpdk::RxMain(void* arg) {
-  RxArgs* args = static_cast<RxArgs*>(arg);
-  args->instance->DoRx(args->queue_id);
-  return 0;
-}
-
-/**
- * @brief 处理网络发送操作的主函数
- * @param arg 包含发送配置信息的参数
- * @return 0 表示成功
- *
- * 该函数在指定的核心上运行，负责发送网络数据包，
- * 处理发送结果，统计发送成功和失败的数量，
- * 并在发送完成后启动超时监控。
- */
-inline int CacheMigrationDpdk::TxMain(void* arg) {
-  // 解析参数，获取发送配置信息
-  TxConf* ctx = static_cast<TxConf*>(arg);
-
-  // 初始化发送统计计数器
-  uint64_t tx_success_count = 0;  // 成功发送的数据包数量
-  uint64_t tx_drop_count = 0;     // 丢弃的数据包数量
-
-  // 从配置中获取队列ID和请求处理范围
-  uint16_t queue_id = ctx->queue_id;
-  size_t start = ctx->interval.first;  // 起始请求ID
-  size_t end = ctx->interval.second;   // 结束请求ID
-
-  // 获取数据包总数
-  size_t total_packets_num = packets.size();
-
-  // 记录发送开始时间
-  send_start_us = get_now_micros();
-
-  // 批量发送数据包
-  constexpr uint16_t BATCH_SIZE =
-      BURST_SIZE;  // 使用定义的BURST_SIZE作为批量大小
-  rte_mbuf* batch_packets[BATCH_SIZE];
-  size_t batch_index = 0;
-
-  // 遍历处理指定范围内的请求
-  for (auto request_id : range(start, end)) {
-    // 设置请求开始时间
-    requests[request_id].start_time = get_now_micros();
-
-    // 计算数据包索引（使用取模运算循环复用数据包模板）
-    // This allows sending more requests than packet templates built
-    size_t packet_index = request_id % total_packets_num;
-    if (packet_index >= packets.size()) {
-      std::cerr << "Error: Attempt to access an out-of-bounds packet index: "
-                << packet_index << " limit: " << packets.size() << std::endl;
-      continue;
-    }
-
-    // 获取数据包并解析网络头部
-    rte_mbuf* packet = packets[packet_index];
-
-    // 解析KV请求头部
-    auto* kv_header =
-        rte_pktmbuf_mtod_offset(packet, KVRequest*, KV_HEADER_OFFSET);
-    if (unlikely(kv_header == nullptr)) {
-      std::cerr << "Error: Invalid KVHeader pointer" << std::endl;
-      continue;
-    }
-
-    // 设置请求ID（转换为网络字节序）
-    kv_header->request_id = rte_cpu_to_be_32(request_id);
-
-    // 获取操作类型（读或写）
-    const uint8_t op = GET_OP(kv_header->combined);
-
-    // 更新操作类型统计
-    (op == READ_REQUEST ? read_count : update_count)
-        .fetch_add(1, std::memory_order_relaxed);
-
-    // 将数据包添加到批处理数组
-    batch_packets[batch_index++] = packet;
-
-    // 当批处理数组满或到达请求末尾时发送数据包
-    if (batch_index == BATCH_SIZE || request_id == end - 1) {
-      if (batch_index > 0) {
-        // 发送批量数据包
-        uint16_t nb_tx =
-            rte_eth_tx_burst(0, queue_id, batch_packets, batch_index);
-
-        // 更新统计信息
-        tx_success_count += nb_tx;
-        tx_drop_count += (batch_index - nb_tx);
-
-        // 处理发送失败的数据包
-        for (auto i : range(nb_tx, batch_index)) {
-          // 计算对应的请求ID
-          size_t failed_request_id = request_id - (batch_index - 1) + i;
-          if (failed_request_id >= start && failed_request_id < end) {
-            requests[failed_request_id].completed.store(true);
-            false_count.fetch_add(1, std::memory_order_relaxed);
-          }
-        }
-
-        // 重置批处理索引
-        batch_index = 0;
-      }
+// 启动DPDK处理线程并等待完成
+void CacheMigrationDpdk::StartDpdk() {
+  for (auto& req : requests) {
+    if (req.completed.load(std::memory_order_acquire)) {
+      rte_exit(EXIT_FAILURE, "Have not completed!");
     }
   }
 
-  // 打印发送统计信息
-  std::cout << "TX thread [" << rte_lcore_id() << "] sent " << tx_success_count
-            << " drop " << tx_drop_count << " requests (queue " << queue_id
-            << ")" << std::endl;
+  for (auto pkt : packets) {
+    if (!pkt) {
+      rte_exit(EXIT_FAILURE, "Have mbuf is nullptr!");
+    }
+  }
 
-  // 启动超时监控
-  RunTimeoutMonitor(arg);
-  return 0;
+  std::cerr << "All " << requests.size() << " requests valid." << std::endl;
+
+  running = true;
+
+  std::cerr << "start DPDK.." << std::endl;
+  LaunchThreads();
+
+  while (completed_count + timeout_count + false_count < total_request_count) {
+    rte_delay_us_sleep(1'000);
+  }
+
+  use_time_us = get_now_micros() - send_start_us;
+  running = false;
+
+  std::cerr << "All requests completed or timed out." << std::endl;
 }
 
+// 在指定的核心上启动RX、TX和超时监控线程
 inline void CacheMigrationDpdk::LaunchThreads() {
   rx_args_.clear();
   for (auto& core : rx_cores_) {
@@ -740,11 +565,251 @@ inline void CacheMigrationDpdk::LaunchThreads() {
       return;
     }
   }
+
+  // 在独立核心上启动多个超时监控线程
+  timeout_args_.clear();
+  size_t num_timeout_cores = timeout_cores_.size();
+  if (num_timeout_cores > 0) {
+    size_t per_timeout_core = total / num_timeout_cores;
+    size_t timeout_remainder = total % num_timeout_cores;
+
+    size_t timeout_offset = 0;
+    for (auto i : range(num_timeout_cores)) {
+      uint lcore_id = timeout_cores_[i].lcore_id;
+
+      auto timeout_conf = std::make_unique<TimeoutConf>();
+      timeout_conf->lcore_id = lcore_id;
+      timeout_conf->queue_id = timeout_cores_[i].queue_id;
+
+      size_t length = per_timeout_core + (i < timeout_remainder ? 1 : 0);
+      timeout_conf->interval = {timeout_offset, timeout_offset + length};
+      timeout_offset += length;
+
+      timeout_args_.push_back(std::move(timeout_conf));
+      int ret = rte_eal_remote_launch(RunTimeoutMonitor,
+                                      timeout_args_.back().get(), lcore_id);
+      if (ret < 0) {
+        std::cerr << "Failed to launch timeout monitor thread on core "
+                  << lcore_id << ", error: " << rte_strerror(-ret) << std::endl;
+        return;
+      }
+    }
+
+    std::cout << "Launched " << num_timeout_cores
+              << " timeout monitor threads on dedicated cores" << std::endl;
+  }
 }
 
+// 批量发送请求并处理超时监控
+inline int CacheMigrationDpdk::TxMain(void* arg) {
+  TxConf* ctx = static_cast<TxConf*>(arg);
+
+  uint64_t tx_success_count = 0;
+  uint64_t tx_drop_count = 0;
+
+  uint16_t queue_id = ctx->queue_id;
+  size_t start = ctx->interval.first;
+  size_t end = ctx->interval.second;
+
+  size_t total_packets_num = packets.size();
+
+  send_start_us = get_now_micros();
+
+  constexpr uint16_t BATCH_SIZE = BURST_SIZE;
+  rte_mbuf* batch_packets[BATCH_SIZE];
+  size_t batch_index = 0;
+
+  for (auto request_id : range(start, end)) {
+    requests[request_id].start_time.store(get_now_micros(),
+                                          std::memory_order_relaxed);
+
+    size_t packet_index = request_id % total_packets_num;
+    if (packet_index >= packets.size()) {
+      std::cerr << "Error: Attempt to access an out-of-bounds packet index: "
+                << packet_index << " limit: " << packets.size() << std::endl;
+      continue;
+    }
+
+    rte_mbuf* packet = packets[packet_index];
+
+    auto* kv_header =
+        rte_pktmbuf_mtod_offset(packet, KVRequest*, KV_HEADER_OFFSET);
+    if (unlikely(kv_header == nullptr)) {
+      std::cerr << "Error: Invalid KVHeader pointer" << std::endl;
+      continue;
+    }
+
+    kv_header->request_id = rte_cpu_to_be_32(request_id);
+
+    const uint8_t op = GET_OP(kv_header->combined);
+
+    (op == READ_REQUEST ? read_count : update_count)
+        .fetch_add(1, std::memory_order_relaxed);
+
+    batch_packets[batch_index++] = packet;
+
+    if (batch_index == BATCH_SIZE || request_id == end - 1) {
+      if (batch_index > 0) {
+        uint16_t nb_tx =
+            rte_eth_tx_burst(0, queue_id, batch_packets, batch_index);
+
+        tx_success_count += nb_tx;
+        tx_drop_count += (batch_index - nb_tx);
+
+        for (auto i : range(nb_tx, batch_index)) {
+          size_t failed_request_id = request_id - (batch_index - 1) + i;
+          if (failed_request_id >= start && failed_request_id < end) {
+            // 发送失败时，不标记为完成，让超时机制处理重试
+            false_count.fetch_add(1, std::memory_order_relaxed);
+          }
+        }
+
+        batch_index = 0;
+      }
+    }
+  }
+
+  std::cout << "TX thread [" << rte_lcore_id() << "] sent " << tx_success_count
+            << " drop " << tx_drop_count << " requests (queue " << queue_id
+            << ")" << std::endl;
+
+  return 0;
+}
+
+// 从网络接收数据包，并将对应的请求标记为已完成
+void CacheMigrationDpdk::DoRx(uint16_t queue_id) {
+  uint lcore_id = rte_lcore_id();
+
+  if (lcore_id == RTE_MAX_LCORE || lcore_id == (unsigned)LCORE_ID_ANY) {
+    printf("Invalid lcore_id = %u\n", lcore_id);
+    return;
+  }
+
+  if (rte_lcore_is_enabled(lcore_id) && lcore_id != rte_get_main_lcore()) {
+    uint16_t port = 0;
+    uint16_t nb_rx;
+
+    if (rte_eth_dev_socket_id(port) >= 0 &&
+        rte_eth_dev_socket_id(port) != (int)rte_socket_id())
+      printf(
+          "WARNING, port %u is on remote NUMA node to "
+          "polling thread.\n\tPerformance will "
+          "not be optimal.\n",
+          port);
+
+    RTE_LOG(NOTICE, CORE, "[RX] %u polling queue: %hu\n", lcore_id, queue_id);
+
+    rte_mbuf* bufs[BURST_SIZE];
+
+    while (running.load(std::memory_order_acquire)) {
+      nb_rx = rte_eth_rx_burst(port, queue_id, bufs, BURST_SIZE);
+
+      if (unlikely(nb_rx == 0)) {
+        continue;
+      } else {
+        completed_count.fetch_add(nb_rx, std::memory_order_relaxed);
+
+        for (auto i : range(nb_rx)) {
+          KVRequest* kv_header =
+              rte_pktmbuf_mtod_offset(bufs[i], KVRequest*, KV_HEADER_OFFSET);
+
+          requests[rte_be_to_cpu_32(kv_header->request_id)].completed.exchange(
+              true);
+
+          rte_pktmbuf_free(bufs[i]);
+        }
+      }
+    }
+  } else {
+    printf("Skip main lcore %u\n", lcore_id);
+  }
+  return;
+}
+
+// RX主循环的包装函数
+inline int CacheMigrationDpdk::RxMain(void* arg) {
+  RxArgs* args = static_cast<RxArgs*>(arg);
+  args->instance->DoRx(args->queue_id);
+  return 0;
+}
+
+// 监控请求超时情况，对超时的请求进行重试
+inline int CacheMigrationDpdk::RunTimeoutMonitor(void* arg) {
+  TimeoutConf* ctx = static_cast<TimeoutConf*>(arg);
+  uint16_t queue_id = ctx->queue_id;
+  size_t start = ctx->interval.first;
+  size_t end = ctx->interval.second;
+
+  constexpr uint64_t kSleepIntervalUs = 1000;
+  const uint16_t kMaxRetries = RETRIES;
+  size_t kBatchSize = (end - start) / 10;
+
+  size_t total_packets = packets.size();
+
+  while (running.load(std::memory_order_acquire)) {
+    for (auto i : range(start, end, kBatchSize)) {
+      size_t batch_end = std::min(i + kBatchSize, end);
+      uint64_t now = get_now_micros();
+
+      for (auto request_id : range(i, batch_end)) {
+        RequestInfo& req = requests[request_id];
+
+        if (req.completed.load(std::memory_order_acquire) ||
+            req.time_out.load(std::memory_order_acquire))
+          continue;
+
+        uint64_t start_time =
+            req.start_time.load(std::memory_order_relaxed);
+        uint64_t elapsed_time = (now >= start_time) ? (now - start_time) : 0;
+
+        int current_retry_count =
+            req.retry_count.load(std::memory_order_acquire);
+
+        uint64_t expected_timeout = time_out_us(current_retry_count);
+        if (elapsed_time < expected_timeout) continue;
+
+        if (current_retry_count > kMaxRetries) {
+          if (req.time_out.exchange(true)) continue;
+          timeout_count.fetch_add(1, std::memory_order_relaxed);
+          continue;
+        }
+
+        size_t packet_index = request_id % total_packets;
+        if (packet_index >= packets.size()) {
+          std::cerr
+              << "Error: Attempt to access an out-of-bounds packet index: "
+              << packet_index << " limit: " << packets.size() << std::endl;
+          continue;
+        }
+        rte_mbuf* packet = packets[packet_index];
+
+        if (packet) {
+          // 双重检查：发送前再次确认请求状态
+          if (req.completed.load(std::memory_order_acquire) ||
+              req.time_out.load(std::memory_order_acquire)) {
+            continue;
+          }
+          int sent = rte_eth_tx_burst(0, queue_id, &packet, 1);
+          if (sent == 1) {
+            timeout_send.fetch_add(1, std::memory_order_relaxed);
+            req.retry_count.fetch_add(1, std::memory_order_relaxed);
+            req.start_time.store(now, std::memory_order_relaxed);
+          }
+        }
+      }
+      rte_delay_us_block(kSleepIntervalUs);
+    }
+  }
+  return 0;
+}
+
+// ============================================================================
+// 第6组：数据包构建（被DB接口调用）
+// ============================================================================
+
+// 构建包含以太网、IP、UDP头部和KV负载的请求数据包
 rte_mbuf* CacheMigrationDpdk::BuildRequestPacket(
-    const std::string& key, uint8_t op, uint32_t req_id,
-    const std::vector<KVPair>& values) {
+    const std::string& key, uint8_t op, const std::vector<KVPair>& values) {
   if (dev_infos_.empty()) {
     RTE_LOG(ERR, PACKET, "No source IP available for packet construction\n");
     return nullptr;
@@ -796,7 +861,7 @@ rte_mbuf* CacheMigrationDpdk::BuildRequestPacket(
   KVRequest* kv_request = reinterpret_cast<KVRequest*>(udp_hdr + 1);
   kv_request->dev_info =
       static_cast<uint8_t>(ENCODE_DEV_INFO(dev_id, DEV_CLIENT));
-  kv_request->request_id = rte_cpu_to_be_32(req_id);
+  kv_request->request_id = 0;
   kv_request->combined =
       static_cast<uint8_t>(ENCODE_COMBINED(CLIENT_REQUEST, op));
   rte_memcpy(kv_request->key.data(), key.data(), KEY_LENGTH);
@@ -807,59 +872,11 @@ rte_mbuf* CacheMigrationDpdk::BuildRequestPacket(
   return mbuf;
 }
 
-int CacheMigrationDpdk::Read(const std::string& /*table*/,
-                             const std::string& key,
-                             const std::vector<std::string>* /*fields*/,
-                             std::vector<KVPair>& /*result*/) {
-  const uint32_t req_id = 0;
+// ============================================================================
+// 第7组：统计输出
+// ============================================================================
 
-  rte_mbuf* mbuf =
-      BuildRequestPacket(key, READ_REQUEST, req_id, DEFAULT_VALUES);
-  if (!mbuf) {
-    false_count.fetch_add(1, std::memory_order_relaxed);
-    std::cerr << "Fail to creat mbuf for: " << req_id << std::endl;
-    return DB::kErrorNoData;
-  }
-
-  packets.push_back(mbuf);
-
-  return DB::kOK;
-}
-
-int CacheMigrationDpdk::Insert(const std::string& /*table*/,
-                               const std::string& key,
-                               std::vector<KVPair>& values) {
-  const uint32_t req_id = 0;
-
-  rte_mbuf* mbuf = BuildRequestPacket(key, WRITE_REQUEST, req_id, values);
-  if (!mbuf) {
-    false_count.fetch_add(1, std::memory_order_relaxed);
-    std::cerr << "Fail to creat mbuf for: " << req_id << std::endl;
-    return DB::kErrorNoData;
-  }
-
-  packets.push_back(mbuf);
-
-  return DB::kOK;
-}
-
-int CacheMigrationDpdk::Update(const std::string& table, const std::string& key,
-                               std::vector<KVPair>& values) {
-  return Insert(table, key, values);
-}
-
-int CacheMigrationDpdk::Scan(const std::string& /*table*/,
-                             const std::string& /*key*/, int /*record_count*/,
-                             const std::vector<std::string>* /*key*/,
-                             std::vector<std::vector<KVPair>>& /*result*/) {
-  return DB::kOK;  // Not implemented for now
-}
-
-int CacheMigrationDpdk::Delete(const std::string& table,
-                               const std::string& key) {
-  return Update(table, key, DEFAULT_VALUES);
-}
-
+// 打印基准测试统计信息，包括IOPS、延迟和操作计数
 void CacheMigrationDpdk::PrintStats() {
   uint64_t total_request = total_request_count.load(std::memory_order_relaxed);
   uint64_t completed = completed_count.load(std::memory_order_relaxed);
@@ -867,7 +884,7 @@ void CacheMigrationDpdk::PrintStats() {
   uint64_t total_latency = total_latency_us.load(std::memory_order_relaxed);
 
   double iops = use_time_us > 0
-                    ? static_cast<double>(completed) * 1'000'000.0 / use_time_us
+                    ? static_cast<double>(completed) * REQ_SIZE / use_time_us
                     : 0.0;
 
   double latency_us_per_request =
@@ -882,7 +899,7 @@ void CacheMigrationDpdk::PrintStats() {
             << "Total Requests Completed: " << completed << "\n"
             << "Total Time (s): " << use_time_us / 1'000'000.0 << "\n"
             << "IOPS: " << iops << "( " << iops / 1'000'000.0 << " M)"
-            << " ops/sec\n"
+            << " ops per sec\n"
             << "Average Latency per Request (ms/op): "
             << latency_us_per_request / 1'000.0 << "\n"
             << "Average Time per Request (us/op): " << average_latency_us
