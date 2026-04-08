@@ -182,6 +182,10 @@ void CacheMigrationDpdk::AllocateSpace(size_t total_ops, size_t req_size) {
     throw std::invalid_argument("total_ops must be greater than 0");
   }
 
+  // Note: total_ops = number of packet templates to build (limited by TX_NUM_MBUFS)
+  //       req_size = total number of requests to send (can be much larger)
+  // The packet templates are reused cyclically to send all requests
+
   total_latency_us.store(0, std::memory_order_relaxed);
   completed_count.store(0, std::memory_order_relaxed);
   timeout_count.store(0, std::memory_order_relaxed);
@@ -205,7 +209,7 @@ void CacheMigrationDpdk::AllocateSpace(size_t total_ops, size_t req_size) {
     pkt = nullptr;
   }
   packets.clear();
-  packets.reserve(total_request_count);
+  packets.reserve(total_ops);  // Only build 'total_ops' packet templates
 }
 
 void CacheMigrationDpdk::Init(const int thread_id) {
@@ -616,7 +620,8 @@ inline int CacheMigrationDpdk::TxMain(void* arg) {
     // 设置请求开始时间
     requests[request_id].start_time = get_now_micros();
 
-    // 计算数据包索引（使用取模运算循环使用数据包）
+    // 计算数据包索引（使用取模运算循环复用数据包模板）
+    // This allows sending more requests than packet templates built
     size_t packet_index = request_id % total_packets_num;
     if (packet_index >= packets.size()) {
       std::cerr << "Error: Attempt to access an out-of-bounds packet index: "

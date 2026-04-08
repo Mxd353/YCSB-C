@@ -79,6 +79,9 @@ const string CoreWorkload::INSERT_START_DEFAULT = "0";
 const string CoreWorkload::RECORD_COUNT_PROPERTY = "recordcount";
 const string CoreWorkload::OPERATION_COUNT_PROPERTY = "operationcount";
 
+const string CoreWorkload::ZIPFIAN_CONST_PROPERTY = "zipfian_const";
+const string CoreWorkload::ZIPFIAN_CONST_DEFAULT = "0.99";
+
 void CoreWorkload::Init(const utils::Properties &p) {
   table_name_ = p.GetProperty(TABLENAME_PROPERTY,TABLENAME_DEFAULT);
 
@@ -87,8 +90,12 @@ void CoreWorkload::Init(const utils::Properties &p) {
 
   field_count_ = std::stoi(p.GetProperty(FIELD_COUNT_PROPERTY,
                                          FIELD_COUNT_DEFAULT));
-  field_len_generator_ = GetFieldLenGenerator(p);
-  
+
+  double zipfian_const = std::stod(p.GetProperty(ZIPFIAN_CONST_PROPERTY,
+                                                 ZIPFIAN_CONST_DEFAULT));
+
+  field_len_generator_ = GetFieldLenGenerator(p, zipfian_const);
+
   double read_proportion = std::stod(p.GetProperty(READ_PROPORTION_PROPERTY,
                                                    READ_PROPORTION_DEFAULT));
   double update_proportion = std::stod(p.GetProperty(UPDATE_PROPORTION_PROPERTY,
@@ -99,7 +106,7 @@ void CoreWorkload::Init(const utils::Properties &p) {
                                                    SCAN_PROPORTION_DEFAULT));
   double readmodifywrite_proportion = std::stod(p.GetProperty(
       READMODIFYWRITE_PROPORTION_PROPERTY, READMODIFYWRITE_PROPORTION_DEFAULT));
-  
+
   record_count_ = std::stoi(p.GetProperty(RECORD_COUNT_PROPERTY));
   std::string request_dist = p.GetProperty(REQUEST_DISTRIBUTION_PROPERTY,
                                            REQUEST_DISTRIBUTION_DEFAULT);
@@ -153,7 +160,8 @@ void CoreWorkload::Init(const utils::Properties &p) {
     // and pick another key.
     int op_count = std::stoi(p.GetProperty(OPERATION_COUNT_PROPERTY));
     int new_keys = (int)(op_count * insert_proportion * 2); // a fudge factor
-    key_chooser_ = new ScrambledZipfianGenerator(record_count_ + new_keys);
+    key_chooser_ = new ScrambledZipfianGenerator(0, record_count_ + new_keys - 1,
+                                                  zipfian_const);
     
   } else if (request_dist == "latest") {
     key_chooser_ = new SkewedLatestGenerator(insert_key_sequence_);
@@ -167,7 +175,7 @@ void CoreWorkload::Init(const utils::Properties &p) {
   if (scan_len_dist == "uniform") {
     scan_len_chooser_ = new UniformGenerator(1, max_scan_len);
   } else if (scan_len_dist == "zipfian") {
-    scan_len_chooser_ = new ZipfianGenerator(1, max_scan_len);
+    scan_len_chooser_ = new ZipfianGenerator(1, max_scan_len, zipfian_const);
   } else {
     throw utils::Exception("Distribution not allowed for scan length: " +
         scan_len_dist);
@@ -175,7 +183,7 @@ void CoreWorkload::Init(const utils::Properties &p) {
 }
 
 ycsbc::Generator<uint64_t> *CoreWorkload::GetFieldLenGenerator(
-    const utils::Properties &p) {
+    const utils::Properties &p, double zipfian_const) {
   string field_len_dist = p.GetProperty(FIELD_LENGTH_DISTRIBUTION_PROPERTY,
                                         FIELD_LENGTH_DISTRIBUTION_DEFAULT);
   int field_len = std::stoi(p.GetProperty(FIELD_LENGTH_PROPERTY,
@@ -185,7 +193,7 @@ ycsbc::Generator<uint64_t> *CoreWorkload::GetFieldLenGenerator(
   } else if(field_len_dist == "uniform") {
     return new UniformGenerator(1, field_len);
   } else if(field_len_dist == "zipfian") {
-    return new ZipfianGenerator(1, field_len);
+    return new ZipfianGenerator(1, field_len, zipfian_const);
   } else {
     throw utils::Exception("Unknown field length distribution: " +
         field_len_dist);

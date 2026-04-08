@@ -1,10 +1,15 @@
 # Yahoo! Cloud System Benchmark
 # Workload F: Read-modify-write workload
 #   Application example: user database, where user records are read and modified by the user or to record user activity.
-#                        
+#
 #   Read/read-modify-write ratio: 50/50
 #   Default data size: 1 KB records (10 fields, 100 bytes each, plus key)
 #   Request distribution: zipfian
+#
+#   Zipfian constant (skewness) configuration:
+#   - zipfian_const=0.99 (default): High skew, ~70% requests to ~1% hot keys
+#   - zipfian_const=0.8: Moderate skew, more distributed access
+#   - zipfian_const=0.0: Uniform distribution, no skew
 
 recordcount=100000
 operationcount=100000
@@ -19,4 +24,5 @@ insertproportion=0
 readmodifywriteproportion=0.5
 
 requestdistribution=zipfian
+# zipfian_const=0.99
 

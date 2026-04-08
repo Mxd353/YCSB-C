@@ -1,10 +1,15 @@
 # Yahoo! Cloud System Benchmark
 # Workload E: Short ranges
 #   Application example: threaded conversations, where each scan is for the posts in a given thread (assumed to be clustered by thread id)
-#                        
+#
 #   Scan/insert ratio: 95/5
 #   Default data size: 1 KB records (10 fields, 100 bytes each, plus key)
 #   Request distribution: zipfian
+#
+#   Zipfian constant (skewness) configuration:
+#   - zipfian_const=0.99 (default): High skew, ~70% requests to ~1% hot keys
+#   - zipfian_const=0.8: Moderate skew, more distributed access
+#   - zipfian_const=0.0: Uniform distribution, no skew
 
 # The insert order is hashed, not ordered. Although the scans are ordered, it does not necessarily
 # follow that the data is inserted in order. For example, posts for thread 342 may not be inserted contiguously, but
@@ -23,6 +28,7 @@ scanproportion=0.95
 insertproportion=0.05
 
 requestdistribution=zipfian
+# zipfian_const=0.99
 
 maxscanlength=100
 

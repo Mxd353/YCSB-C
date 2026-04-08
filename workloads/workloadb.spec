@@ -5,6 +5,11 @@
 #   Read/update ratio: 95/5
 #   Default data size: 1 KB records (10 fields, 100 bytes each, plus key)
 #   Request distribution: zipfian
+#
+#   Zipfian constant (skewness) configuration:
+#   - zipfian_const=0.99 (default): High skew, ~70% requests to ~1% hot keys
+#   - zipfian_const=0.8: Moderate skew, more distributed access
+#   - zipfian_const=0.0: Uniform distribution, no skew
 
 recordcount=30000
 operationcount=100000000
@@ -18,3 +23,4 @@ scanproportion=0
 insertproportion=0
 
 requestdistribution=zipfian
+# zipfian_const=0.99

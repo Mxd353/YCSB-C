@@ -142,6 +142,13 @@ class CoreWorkload {
   static const std::string OPERATION_COUNT_PROPERTY;
 
   ///
+  /// The name of the property for the zipfian constant (skewness).
+  /// Default is 0.99. Use 0.0 for uniform distribution.
+  ///
+  static const std::string ZIPFIAN_CONST_PROPERTY;
+  static const std::string ZIPFIAN_CONST_DEFAULT;
+
+  ///
   /// Initialize the scenario.
   /// Called once, in the main client thread, before any operations are started.
   ///
@@ -187,7 +194,8 @@ class CoreWorkload {
   }
 
  protected:
-  static Generator<uint64_t> *GetFieldLenGenerator(const utils::Properties &p);
+  static Generator<uint64_t> *GetFieldLenGenerator(const utils::Properties &p,
+                                                    double zipfian_const);
   std::string BuildKeyName(uint64_t key_num);
 
   std::string table_name_;

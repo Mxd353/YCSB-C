@@ -14,6 +14,9 @@
 #include "lib/consistent_hash.h"
 #include "lib/request_map.h"
 
+// TX_NUM_MBUFS: Maximum packet templates that can be built
+// Actual packets built = min(operationcount, TX_NUM_MBUFS)
+// More requests are sent by reusing these templates cyclically
 #define TX_NUM_MBUFS 4'194'303
 #define RX_NUM_MBUFS 262'143
 #define MBUF_CACHE_SIZE 512
