@@ -19,8 +19,10 @@ using namespace utils;
 
 extern char* __progname;
 
+// High performance pipeline mode: no pre-built packets
+// Requests are tracked for timeout monitoring
 static std::vector<RequestInfo> requests;
-static std::vector<rte_mbuf*> packets;
+// packets vector removed - now built on-the-fly in pipeline
 
 // std::atomic<uint32_t> utils::RequestIDGenerator::counter{0};
 
@@ -891,166 +893,6 @@ void CacheMigrationDpdk::PrintStats() {
             << "  Total Updates: " << update_count.load() << "\n"
             << "  Time Out: " << timeout_count.load() << "\n"
             << "  TimeoutMonitor Send: " << timeout_send.load() << std::endl;
-}
-
-// ==================== High Performance Pipeline Mode ====================
-// 边构造边发送的高性能实现，目标1MQPS
-
-// Forward declaration for pipeline mode
-inline int TxMainPipelineWrapper(void* arg);
-
-inline int CacheMigrationDpdk::TxMainPipeline(void* arg) {
-  TxConf* ctx = static_cast<TxConf*>(arg);
-  uint16_t queue_id = ctx->queue_id;
-  size_t start = ctx->interval.first;
-  size_t end = ctx->interval.second;
-  CacheMigrationDpdk* self = static_cast<CacheMigrationDpdk*>(ctx->instance);
-
-  if (!self) {
-    std::cerr << "Error: No instance pointer in TxMainPipeline!" << std::endl;
-    return -1;
-  }
-
-  uint64_t tx_success_count = 0;
-  uint64_t tx_drop_count = 0;
-
-  // 批量大小调优：64为10G/25G网络的最佳点
-  constexpr uint16_t BATCH_SIZE = 64;
-  rte_mbuf* batch_packets[BATCH_SIZE];
-
-  // 获取key模板数量
-  size_t num_templates = self->key_templates_.size();
-  if (num_templates == 0) {
-    std::cerr << "Error: No key templates generated!" << std::endl;
-    return -1;
-  }
-
-  // 记录发送开始时间
-  send_start_us = get_now_micros();
-
-  size_t request_id = start;
-  while (request_id < end && running.load(std::memory_order_acquire)) {
-    // 1. 批量分配mbuf
-    uint16_t batch_count = std::min<uint16_t>(BATCH_SIZE, end - request_id);
-    uint16_t alloced = rte_pktmbuf_alloc_bulk(self->tx_mbufpool_, batch_packets, batch_count);
-    if (unlikely(alloced != batch_count)) {
-      // 分配失败，释放已分配的并重试
-      for (uint16_t i = 0; i < alloced; i++) {
-        rte_pktmbuf_free(batch_packets[i]);
-      }
-      rte_delay_us_block(1);
-      continue;
-    }
-
-    // 2. 批量构造包
-    for (uint16_t i = 0; i < batch_count; i++) {
-      size_t req_idx = request_id + i;
-
-      // 设置请求开始时间
-      requests[req_idx].start_time = get_now_micros();
-
-      // 选择key模板（循环使用）
-      const KeyTemplate& key_template = self->key_templates_[req_idx % num_templates];
-
-      // 构造包
-      rte_mbuf* mbuf = batch_packets[i];
-      char* pkt_data = rte_pktmbuf_append(mbuf, TOTAL_LEN);
-      if (unlikely(!pkt_data)) {
-        std::cerr << "Error: Failed to append packet data" << std::endl;
-        rte_pktmbuf_free(mbuf);
-        batch_packets[i] = nullptr;
-        continue;
-      }
-
-      // 填充头部 (ETH + IP + UDP + KV)
-      // ETH头
-      rte_ether_hdr* eth_hdr = reinterpret_cast<rte_ether_hdr*>(pkt_data);
-      rte_ether_addr_copy(&self->s_eth_addr_, &eth_hdr->src_addr);
-      rte_ether_addr_copy(&self->d_eth_addr_, &eth_hdr->dst_addr);
-      eth_hdr->ether_type = rte_cpu_to_be_16(RTE_ETHER_TYPE_IPV4);
-
-      // IP头
-      rte_ipv4_hdr* ip_hdr = reinterpret_cast<rte_ipv4_hdr*>(eth_hdr + 1);
-      ip_hdr->ihl = 5;
-      ip_hdr->version = 4;
-      ip_hdr->type_of_service = 0;
-      ip_hdr->total_length = rte_cpu_to_be_16(TOTAL_LEN - RTE_ETHER_HDR_LEN);
-      ip_hdr->packet_id = rte_cpu_to_be_16(54321);
-      ip_hdr->next_proto_id = IPPROTO_UDP;
-      ip_hdr->time_to_live = 64;
-      ip_hdr->src_addr = self->dev_infos_[0].src_ip;
-      ip_hdr->dst_addr = key_template.dst_ip;
-      ip_hdr->hdr_checksum = 0;
-      ip_hdr->hdr_checksum = rte_ipv4_cksum(ip_hdr);
-
-      // UDP头
-      rte_udp_hdr* udp_hdr = reinterpret_cast<rte_udp_hdr*>(ip_hdr + 1);
-      udp_hdr->src_port = rte_cpu_to_be_16(UDP_PORT_KV);
-      udp_hdr->dst_port = rte_cpu_to_be_16(UDP_PORT_KV);
-      udp_hdr->dgram_len = rte_cpu_to_be_16(UDP_HDR_LEN + KV_HDR_LEN);
-      udp_hdr->dgram_cksum = rte_ipv4_udptcp_cksum(ip_hdr, udp_hdr);
-
-      // KV请求头
-      KVRequest* kv_req = reinterpret_cast<KVRequest*>(udp_hdr + 1);
-      uint8_t dev_id = self->dev_infos_.empty() ? 0 : self->dev_infos_[0].dev_id;
-      kv_req->dev_info = static_cast<uint8_t>(ENCODE_DEV_INFO(dev_id, DEV_CLIENT));
-      kv_req->request_id = rte_cpu_to_be_32(req_idx);
-      // 根据req_idx决定操作类型
-      uint8_t op = (req_idx % 2 == 0) ? READ_REQUEST : WRITE_REQUEST;
-      kv_req->combined = static_cast<uint8_t>(ENCODE_COMBINED(CLIENT_REQUEST, op));
-      rte_memcpy(kv_req->key.data(), key_template.data, KEY_LENGTH);
-      // 填充value
-      if (op == READ_REQUEST) {
-        rte_memcpy(kv_req->value1.data(), "READ", 4);
-      } else {
-        rte_memcpy(kv_req->value1.data(), "WRITE", 5);
-      }
-
-      // 更新操作统计
-      (op == READ_REQUEST ? read_count : update_count)
-          .fetch_add(1, std::memory_order_relaxed);
-    }
-
-    // 3. 批量发送
-    uint16_t nb_tx = rte_eth_tx_burst(0, queue_id, batch_packets, batch_count);
-    tx_success_count += nb_tx;
-    tx_drop_count += (batch_count - nb_tx);
-
-    // 4. 释放mbuf（发送失败的）
-    for (uint16_t i = nb_tx; i < batch_count; i++) {
-      if (batch_packets[i]) {
-        rte_pktmbuf_free(batch_packets[i]);
-        size_t failed_req_id = request_id + i;
-        requests[failed_req_id].completed.store(true);
-        false_count.fetch_add(1, std::memory_order_relaxed);
-      }
-    }
-
-    request_id += batch_count;
-  }
-
-  uint64_t elapsed_us = get_now_micros() - send_start_us;
-  double qps = (tx_success_count * 1000000.0) / elapsed_us;
-
-  std::cout << "[Pipeline TX] Core " << rte_lcore_id()
-            << " sent " << tx_success_count << " drop " << tx_drop_count
-            << " QPS: " << std::fixed << std::setprecision(2) << qps
-            << " (queue " << queue_id << ")" << std::endl;
-
-  // 启动超时监控
-  RunTimeoutMonitor(arg);
-  return 0;
-}
-
-// Wrapper for rte_eal_remote_launch - calls the member function
-inline int TxMainPipelineWrapper(void* arg) {
-  TxConf* ctx = static_cast<TxConf*>(arg);
-  if (!ctx || !ctx->instance) {
-    std::cerr << "Error: Invalid TxConf in wrapper!" << std::endl;
-    return -1;
-  }
-  // Call the member function through the instance pointer
-  return ctx->instance->TxMainPipeline(arg);
 }
 
 }  // namespace ycsbc

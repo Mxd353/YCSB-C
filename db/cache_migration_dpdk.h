@@ -14,9 +14,8 @@
 #include "lib/consistent_hash.h"
 #include "lib/request_map.h"
 
-// TX_NUM_MBUFS: Maximum packet templates that can be built
-// Actual packets built = min(operationcount, TX_NUM_MBUFS)
-// More requests are sent by reusing these templates cyclically
+// High performance pipeline mode: build packets on-the-fly
+// Batch size tuned for 1M QPS target
 #define TX_NUM_MBUFS 4'194'303
 #define RX_NUM_MBUFS 262'143
 #define MBUF_CACHE_SIZE 512
@@ -26,6 +25,13 @@
 #define TX_RING_SIZE 4096
 #define TX_RING_COUNT 32
 #define BURST_SIZE 32
+
+// Batch size for pipeline: alloc -> build -> send
+// Larger batch = better throughput, but higher latency
+// 64 is optimal for 10G/25G networks
+#define PIPELINE_BATCH_SIZE 64
+
+// Total requests to send (100M for 1MQPS sustained test)
 #define REQ_SIZE 100'000'000
 
 #define RTE_LOGTYPE_CORE RTE_LOGTYPE_USER3
@@ -82,15 +88,27 @@ struct RequestInfo {
   RequestInfo& operator=(const RequestInfo&) = delete;
 };
 
+// Forward declaration
+namespace ycsbc {
+  class CacheMigrationDpdk;
+}
+
 struct TxConf {
   uint lcore_id;
   uint16_t queue_id = 0;
   std::pair<size_t, size_t> interval{0, 0};
+  ycsbc::CacheMigrationDpdk* instance = nullptr;  // For pipeline mode
 };
 
 struct RxConf {
   uint lcore_id;
   uint16_t queue_id = 0;
+};
+
+// Pre-generated key template for fast packet construction
+struct KeyTemplate {
+  char data[c_m_proto::KEY_LENGTH];
+  rte_be32_t dst_ip;  // Pre-computed destination IP
 };
 
 namespace ycsbc {
@@ -121,6 +139,12 @@ class CacheMigrationDpdk : public DB {
            std::vector<std::vector<KVPair>>& result) override;
 
   void PrintStats() override;
+
+  // High performance pipeline: build and send packets on-the-fly
+  // No pre-built packet templates - construct in pipeline
+
+  // Friend declaration for wrapper function
+  friend int TxMainPipelineWrapper(void* arg);
 
  private:
   const int num_threads_;
@@ -158,18 +182,35 @@ class CacheMigrationDpdk : public DB {
 
   std::vector<DevInfo> dev_infos_;
 
+  // Pre-generated key templates for fast packet construction
+  std::vector<KeyTemplate> key_templates_;
+  size_t num_key_templates_ = 0;
+
   inline void AssignCores();
   int PortInit(uint16_t port);
   inline void LaunchThreads();
+
+  // Build single packet (for load phase)
   rte_mbuf* BuildRequestPacket(const std::string& key, uint8_t op,
                                uint32_t req_id,
                                const std::vector<KVPair>& values);
+
+  // High performance: build packet using pre-generated template
+  void BuildPacketFromTemplate(rte_mbuf* mbuf, const KeyTemplate& key_template,
+                               uint8_t op, uint32_t req_id);
+
+  // Batch allocate and build packets
+  uint16_t BuildAndSendBatch(uint16_t queue_id, size_t start_req_id,
+                             uint16_t batch_size);
 
   static inline int RunTimeoutMonitor(void* arg);
   void DoRx(uint16_t queue_id);
 
   static inline int RxMain(void* arg);
   static inline int TxMain(void* arg);
+
+  // Optimized TxMain for pipeline mode (member function for access to instance vars)
+  inline int TxMainPipeline(void* arg);
 };
 }  // namespace ycsbc
 
