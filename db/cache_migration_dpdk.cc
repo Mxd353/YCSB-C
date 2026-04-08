@@ -183,9 +183,9 @@ void CacheMigrationDpdk::AllocateSpace(size_t total_ops, size_t req_size) {
     throw std::invalid_argument("total_ops must be greater than 0");
   }
 
-  // Note: total_ops = number of packet templates to build (limited by TX_NUM_MBUFS)
-  //       req_size = total number of requests to send (can be much larger)
-  // The packet templates are reused cyclically to send all requests
+  // Note: total_ops = number of key templates to pre-generate
+  //       req_size = total number of requests to send (now equals total_ops)
+  // Each request uses a key template cyclically
 
   total_latency_us.store(0, std::memory_order_relaxed);
   completed_count.store(0, std::memory_order_relaxed);
@@ -200,17 +200,41 @@ void CacheMigrationDpdk::AllocateSpace(size_t total_ops, size_t req_size) {
   requests.clear();
   requests.resize(req_size);
 
+  // Clean up existing packets (for traditional mode)
   for (auto pkt : packets) {
     if (pkt == nullptr) {
       std::cerr << "Error: Attempt to free a null pointer" << std::endl;
       continue;
     }
-
     rte_pktmbuf_free(pkt);
     pkt = nullptr;
   }
   packets.clear();
-  packets.reserve(total_ops);  // Only build 'total_ops' packet templates
+  packets.reserve(total_ops);
+
+  // Pre-generate key templates for pipeline mode
+  // Key templates store pre-computed keys and destination IPs
+  key_templates_.clear();
+  key_templates_.reserve(total_ops);
+  
+  std::cout << "Pre-generating " << total_ops << " key templates..." << std::endl;
+  
+  for (size_t i = 0; i < total_ops; i++) {
+    KeyTemplate kt;
+    // Generate key based on index (similar to YCSB key format)
+    // Format: zero-padded hexadecimal string
+    // sizeof(kt.data) = KEY_LENGTH + 1, allowing space for null terminator
+    snprintf(kt.data, sizeof(kt.data), "%016lx", i);
+    
+    // Pre-compute destination IP using consistent hash
+    std::string key_str(kt.data, KEY_LENGTH);
+    kt.dst_ip = consistent_hash_.GetServerIp(key_str);
+    
+    key_templates_.push_back(kt);
+  }
+  
+  num_key_templates_ = key_templates_.size();
+  std::cout << "Generated " << num_key_templates_ << " key templates" << std::endl;
 }
 
 void CacheMigrationDpdk::Init(const int thread_id) {

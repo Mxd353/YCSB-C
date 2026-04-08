@@ -141,10 +141,10 @@ int main(const int argc, const char *argv[]) {
   }
 
   actual_ops.clear();
-  // Build 'operationcount' packet templates, send REQ_SIZE (100M) requests
-  // The packet templates are reused cyclically to send all requests
+  // Build 'operationcount' packet templates, send 'operationcount' requests
+  // Each operation corresponds to one request (1:1 mapping)
   total_ops = stoi(props[ycsbc::CoreWorkload::OPERATION_COUNT_PROPERTY]);
-  db->AllocateSpace(total_ops, REQ_SIZE);
+  db->AllocateSpace(total_ops, total_ops);
   int threads_to_launch = std::min(num_threads, total_ops);
   int ops_per_thread = total_ops / threads_to_launch;
 

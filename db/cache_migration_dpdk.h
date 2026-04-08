@@ -107,7 +107,8 @@ struct RxConf {
 
 // Pre-generated key template for fast packet construction
 struct KeyTemplate {
-  char data[c_m_proto::KEY_LENGTH];
+  // +1 for null terminator to safely use snprintf
+  char data[c_m_proto::KEY_LENGTH + 1];
   rte_be32_t dst_ip;  // Pre-computed destination IP
 };
 
