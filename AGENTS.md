@@ -10,6 +10,9 @@ mkdir -p build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release
 make -j$(nproc)
 
+# Clean build
+rm -rf build && mkdir build && cd build && cmake .. && make -j$(nproc)
+
 # Clean
 make clean
 
@@ -54,15 +57,15 @@ sudo valgrind --leak-check=full ./build/ycsbc -T 1 -P workloads/workloada.spec
 - GCC 13+ with `-Wall -Wextra -Werror`
 
 ### Naming
-| Type | Convention | Example |
-|------|------------|---------|
-| Classes/Structs | PascalCase | `CacheMigrationDpdk`, `RequestInfo` |
-| Namespaces | lowercase | `ycsbc`, `utils` |
-| Member variables | trailing underscore | `name_`, `db_` |
-| Local variables | snake_case | `key`, `result` |
-| Constants | k + PascalCase | `kOK`, `kErrorNoData` |
-| Macros | UPPER_CASE | `KEY_LENGTH`, `TX_NUM_MBUFS` |
-| Functions | PascalCase | `DoInsert()`, `GetName()` |
+| Type             | Convention          | Example                             |
+| ---------------- | ------------------- | ----------------------------------- |
+| Classes/Structs  | PascalCase          | `CacheMigrationDpdk`, `RequestInfo` |
+| Namespaces       | lowercase           | `ycsbc`, `utils`                    |
+| Member variables | trailing underscore | `name_`, `db_`                      |
+| Local variables  | snake_case          | `key`, `result`                     |
+| Constants        | k + PascalCase      | `kOK`, `kErrorNoData`               |
+| Macros           | UPPER_CASE          | `KEY_LENGTH`, `TX_NUM_MBUFS`        |
+| Functions        | PascalCase          | `DoInsert()`, `GetName()`           |
 
 ### Formatting
 - **Indentation**: 2 spaces (no tabs)
