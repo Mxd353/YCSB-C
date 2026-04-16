@@ -15,19 +15,20 @@
 // TX_NUM_MBUFS: Maximum packet templates that can be built
 // Actual packets built = min(operationcount, TX_NUM_MBUFS)
 // More requests are sent by reusing these templates cyclically
-#define TX_NUM_MBUFS 4'194'303
-#define RX_NUM_MBUFS 262'143
-#define MBUF_CACHE_SIZE 512
+#define TX_NUM_MBUFS 1'048'575
+#define RX_NUM_MBUFS 32'767
+#define MBUF_CACHE_SIZE 256
 #define TX_MBUF_DATA_SIZE 256
 #define RX_MBUF_DATA_SIZE 512
-#define RX_RING_SIZE 8192
-#define TX_RING_SIZE 4096
+#define RX_RING_SIZE 2048
+#define TX_RING_SIZE 1024
 #define TX_RING_COUNT 32
 #define BURST_SIZE 32
 #define REQ_SIZE 100'000'000.0
 
 #define RTE_LOGTYPE_CORE RTE_LOGTYPE_USER3
 #define RTE_LOGTYPE_PACKET RTE_LOGTYPE_USER4
+#define RTE_LOGTYPE_PORT RTE_LOGTYPE_USER5
 
 extern std::atomic<bool> running;
 

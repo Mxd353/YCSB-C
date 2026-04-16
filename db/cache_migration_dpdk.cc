@@ -109,20 +109,19 @@ CacheMigrationDpdk::CacheMigrationDpdk(utils::Properties& props)
     return;
   }
 
-  uint32_t data_size = (uint32_t)TOTAL_LEN + sizeof(rte_mbuf);
-  data_size = 1 << (32 - __builtin_clz(data_size - 1));
-
-  tx_mbufpool_ =
-      rte_pktmbuf_pool_create("TX_MBUF_POOL", TX_NUM_MBUFS, MBUF_CACHE_SIZE, 0,
-                              data_size, rte_socket_id());
+  tx_mbufpool_ = rte_pktmbuf_pool_create(
+      "TX_MBUF_POOL", TX_NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
+      TX_MBUF_DATA_SIZE, rte_socket_id());
   if (tx_mbufpool_ == NULL)
-    rte_exit(EXIT_FAILURE, "Cannot create TX_MBUF_POOL\n");
+    rte_exit(EXIT_FAILURE, "Cannot create TX_MBUF_POOL failed: %s\n",
+             rte_strerror(rte_errno));
 
-  rx_mbufpool_ =
-      rte_pktmbuf_pool_create("RX_MBUF_POOL", RX_NUM_MBUFS, MBUF_CACHE_SIZE, 0,
-                              RX_MBUF_DATA_SIZE, rte_socket_id());
+  rx_mbufpool_ = rte_pktmbuf_pool_create(
+      "RX_MBUF_POOL", RX_NUM_MBUFS * nb_ports, MBUF_CACHE_SIZE, 0,
+      RX_MBUF_DATA_SIZE, rte_socket_id());
   if (rx_mbufpool_ == NULL)
-    rte_exit(EXIT_FAILURE, "Cannot create RX_MBUF_POOL\n");
+    rte_exit(EXIT_FAILURE, "Cannot create RX_MBUF_POOL failed: %s\n",
+             rte_strerror(rte_errno));
 
   // 分配核心并初始化端口
   AssignCores();
@@ -193,7 +192,7 @@ void CacheMigrationDpdk::AllocateSpace(size_t total_ops, size_t req_size) {
   use_time_us = 0;
 
   requests.clear();
-  requests.resize(req_size);
+  requests.resize(total_ops);
 
   for (auto pkt : packets) {
     if (pkt == nullptr) {
@@ -292,6 +291,8 @@ inline void CacheMigrationDpdk::AssignCores() {
   uint lcore_id;
   std::vector<uint> workers;
 
+  RTE_LOG(NOTICE, CORE, "lcore_count = %u\n", rte_lcore_count());
+
   RTE_LCORE_FOREACH_WORKER(lcore_id) { workers.push_back(lcore_id); }
 
   size_t total_workers = workers.size();
@@ -331,11 +332,11 @@ inline void CacheMigrationDpdk::AssignCores() {
     timeout_cores_.emplace_back(TimeoutConf{workers[idx++], queue_id});
   }
 
-  printf(
-      "Assigned %zu RX cores (50%%), %zu TX cores (25%%), "
-      "%zu Timeout cores (25%%), total %zu TX queues\n",
-      rx_cores_.size(), tx_cores_.size(), timeout_cores_.size(),
-      tx_cores_.size() + timeout_cores_.size());
+  RTE_LOG(NOTICE, CORE,
+          "Assigned %zu RX cores (50%%), %zu TX cores (25%%), "
+          "%zu Timeout cores (25%%), total %zu TX queues\n",
+          rx_cores_.size(), tx_cores_.size(), timeout_cores_.size(),
+          tx_cores_.size() + timeout_cores_.size());
 }
 
 // 初始化以太网端口，配置RSS和硬件卸载功能
@@ -358,11 +359,11 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
   struct rte_eth_rxmode tmp_rxmode;
   memset(&tmp_rxmode, 0, sizeof(rte_eth_rxmode));
   tmp_rxmode.mq_mode = RTE_ETH_MQ_RX_RSS;
-  tmp_rxmode.mtu = RX_MBUF_DATA_SIZE;
+  tmp_rxmode.mtu = 256;
 
-  rte_eth_rss_conf rss_conf;
+  rte_eth_rss_conf rss_conf = {};
   rss_conf.rss_hf = RTE_ETH_RSS_IP | RTE_ETH_RSS_UDP;
-  rss_conf.rss_key_len = 40;
+  rss_conf.rss_key_len = 0;
   rss_conf.rss_key = NULL;
 
   port_conf_default.rxmode = tmp_rxmode;
@@ -374,7 +375,7 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
   rte_eth_dev_info dev_info;
   retval = rte_eth_dev_info_get(port, &dev_info);
   if (retval != 0) {
-    RTE_LOG(ERR, EAL, "Error during getting device (port %u) info: %s\n", port,
+    RTE_LOG(ERR, PORT, "Error during getting device (port %u) info: %s\n", port,
             strerror(-retval));
     return retval;
   }
@@ -404,16 +405,16 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
              dev_info.max_tx_queues);
   }
 
-  RTE_LOG(NOTICE, EAL,
+  RTE_LOG(NOTICE, PORT,
           "Hardware supports: max_rx_queues=%u, max_tx_queues=%u\n",
           dev_info.max_rx_queues, dev_info.max_tx_queues);
-  RTE_LOG(NOTICE, EAL, "Requesting: rx_queues=%u, tx_queues=%u\n", nb_rx_cores,
+  RTE_LOG(NOTICE, PORT, "Requesting: rx_queues=%u, tx_queues=%u\n", nb_rx_cores,
           nb_tx_cores);
 
   port_conf.rx_adv_conf.rss_conf.rss_hf &= dev_info.flow_type_rss_offloads;
   if (port_conf.rx_adv_conf.rss_conf.rss_hf !=
       port_conf_default.rx_adv_conf.rss_conf.rss_hf) {
-    RTE_LOG(ERR, EAL,
+    RTE_LOG(ERR, PORT,
             "Port %u modified RSS hash function based on hardware support,"
             "requested:%#" PRIx64 " configured:%#" PRIx64 "\n",
             port, port_conf_default.rx_adv_conf.rss_conf.rss_hf,
@@ -425,7 +426,7 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
 
   retval = rte_eth_dev_adjust_nb_rx_tx_desc(port, &nb_rxd, &nb_txd);
   if (retval != 0) rte_exit(EXIT_FAILURE, "Cannot adjust desc number\n");
-  RTE_LOG(NOTICE, EAL, "Adjusted nb_rxd = %u, nb_txd = %u\n", nb_rxd, nb_txd);
+  RTE_LOG(NOTICE, PORT, "Adjusted nb_rxd = %u, nb_txd = %u\n", nb_rxd, nb_txd);
 
   struct rte_eth_rxconf rxconf = dev_info.default_rxconf;
   rxconf.offloads = port_conf.rxmode.offloads;
@@ -456,14 +457,14 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
     retval = rte_eth_tx_queue_setup(port, queue_id, nb_txd,
                                     rte_eth_dev_socket_id(port), &txconf);
     if (retval < 0) {
-      RTE_LOG(ERR, EAL, "Cannot setup Timeout TX queue %u\n", queue_id);
+      RTE_LOG(ERR, PORT, "Cannot setup Timeout TX queue %u\n", queue_id);
       rte_exit(EXIT_FAILURE, "Cannot setup Timeout TX queue\n");
     }
     // queue_id已经在AssignCores中设置到timeout_cores_
   }
 
   RTE_LOG(
-      NOTICE, EAL,
+      NOTICE, PORT,
       "Setup %zu TX queues for TX threads, %zu TX queues for Timeout threads\n",
       tx_cores_.size(), timeout_cores_.size());
 
@@ -473,7 +474,7 @@ int CacheMigrationDpdk::PortInit(uint16_t port) {
   retval = rte_eth_dev_start(port);
   if (retval < 0) rte_exit(EXIT_FAILURE, "Cannot start port\n");
 
-  RTE_LOG(NOTICE, EAL, "Port %u MAC: " RTE_ETHER_ADDR_PRT_FMT "\n",
+  RTE_LOG(NOTICE, PORT, "Port %u MAC: " RTE_ETHER_ADDR_PRT_FMT "\n",
           (unsigned)port, RTE_ETHER_ADDR_BYTES(&s_eth_addr_));
 
   return 0;
@@ -663,7 +664,7 @@ inline int CacheMigrationDpdk::TxMain(void* arg) {
             false_count.fetch_add(1, std::memory_order_relaxed);
           }
         }
-
+        rte_delay_us_block(100);
         batch_index = 0;
       }
     }
@@ -758,8 +759,7 @@ inline int CacheMigrationDpdk::RunTimeoutMonitor(void* arg) {
             req.time_out.load(std::memory_order_acquire))
           continue;
 
-        uint64_t start_time =
-            req.start_time.load(std::memory_order_relaxed);
+        uint64_t start_time = req.start_time.load(std::memory_order_relaxed);
         uint64_t elapsed_time = (now >= start_time) ? (now - start_time) : 0;
 
         int current_retry_count =

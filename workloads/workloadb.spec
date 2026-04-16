@@ -12,7 +12,7 @@
 #   - zipfian_const=0.0: Uniform distribution, no skew
 
 recordcount=30000
-operationcount=100000000
+operationcount=1000000
 workload=com.yahoo.ycsb.workloads.CoreWorkload
 
 readallfields=true
